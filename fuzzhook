@@ -1,0 +1,866 @@
+-- Matcha LuaVM: FurryHook (optimized)
+-- Notes:
+--  * UI.AddTab's callback runs every frame, so it only reads pre-built data
+--    (no closures / string building inside it).
+--  * Username and the Players folder are resolved once and cached.
+--  * A feature does no work while its toggle is off.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+
+-- Username is resolved ONCE at launch and reused by every feature below.
+local LOCAL_NAME = Players.LocalPlayer.Name
+
+-- Attribute names under Status.Purchases.Passes that mark someone as staff.
+local STAFF_TAGS = {
+    "GivenElitePass", -- TEST: detecting Elite players
+}
+
+local TICK_SECONDS = 0.5       -- main loop interval
+local STAFF_SCAN_EVERY = 4     -- 4 ticks * 0.5s = 2s between staff scans
+local LABEL_OFFSET = Vector3.new(0, 3.2, 0)
+local INFO_RADIUS = 150        -- px from screen center a player must be within to count as "looked at"
+local INFO_SELECT_EVERY = 0.1  -- how often the looked-at player is re-picked (seconds)
+local INFO_REFRESH = 2         -- how often the looked-at player's stats are re-read (seconds)
+local INV_MAX_LINES = 26       -- max rows shown in the Inv Aim panel
+local INV_MAX_NODES = 150      -- safety cap on items read per inventory scan
+local INV_MAX_DEPTH = 4        -- how deep nested items are shown ({ } nesting)
+
+-- Inv Aim categories. Put EXACT item names (as they appear in the Inventory) in a list.
+-- Any item not listed anywhere falls into "Miscellaneous".
+-- Hiding a category hides its items and everything inside them.
+local MISC = "Miscellaneous"
+local CATEGORY_ITEMS = {
+    ["Equipment"] = {},
+    ["Weapons"] = {},
+    ["Keys"] = {
+        "KeyChain", "EVACKey", "LighthouseKey", "FrigateKey", "CitySubstationtKey",
+        "Apartment21Key", "Villa1Key", "CraneKey", "Apartment13Key",
+    },
+    ["Valuables"] = {},
+    ["Meds"] = {},
+    ["Stims"] = {},
+    ["Extremely Valuables"] = {},
+}
+local CATEGORIES = { "Equipment", "Weapons", "Keys", "Valuables", "Meds", "Stims", "Extremely Valuables", MISC }
+
+local ITEM_CATEGORY = {} -- [itemName] = category (built once)
+for cat, items in pairs(CATEGORY_ITEMS) do
+    for _, itemName in ipairs(items) do
+        ITEM_CATEGORY[itemName] = cat
+    end
+end
+
+----------------------------------------------------------------------
+-- NOTIFICATION BOX (reusable)
+-- Bottom-right box drawn with the Drawing API, stacks upward.
+-- Use it for anything:
+--   Notification.push("Title", "Message")
+--   Notification.push("Title", "Message", { seconds = 15, color = Color3.fromRGB(255,160,0) })
+----------------------------------------------------------------------
+local Notification = {}
+do
+    local slots = {}
+    local DEFAULT_COLOR = Color3.fromRGB(255, 80, 80)
+    local BG_COLOR = Color3.fromRGB(25, 25, 30)
+    local TITLE_COLOR = Color3.fromRGB(255, 255, 255)
+    local TEXT_COLOR = Color3.fromRGB(200, 200, 200)
+    local W, H = 300, 54
+
+    function Notification.push(title, message, opts)
+        opts = opts or {}
+        local seconds = opts.seconds or 10
+        local accent = opts.color or DEFAULT_COLOR
+
+        local slot = 1
+        while slots[slot] do slot = slot + 1 end
+        slots[slot] = true
+
+        task.spawn(function()
+            local created = {} -- every drawing made, so cleanup always removes them
+
+            local function make(class, props)
+                local d = Drawing.new(class)
+                created[#created + 1] = d
+                for k, v in pairs(props) do
+                    d[k] = v
+                end
+                return d
+            end
+
+            local built = pcall(function()
+                local view = Workspace.CurrentCamera.ViewportSize
+                local x = view.X - W - 20
+                local y = view.Y - (H + 10) * slot - 10
+
+                make("Square", {
+                    Filled = true, Color = BG_COLOR,
+                    Position = Vector2.new(x, y), Size = Vector2.new(W, H),
+                    ZIndex = 1, Visible = true,
+                })
+                make("Square", {
+                    Filled = true, Color = accent,
+                    Position = Vector2.new(x, y), Size = Vector2.new(4, H),
+                    ZIndex = 2, Visible = true,
+                })
+                make("Text", {
+                    Text = title, Color = TITLE_COLOR,
+                    Font = Drawing.Fonts.SystemBold, Size = 16,
+                    Position = Vector2.new(x + 14, y + 8),
+                    ZIndex = 3, Visible = true,
+                })
+                make("Text", {
+                    Text = message, Color = TEXT_COLOR,
+                    Font = Drawing.Fonts.System, Size = 14,
+                    Position = Vector2.new(x + 14, y + 29),
+                    ZIndex = 3, Visible = true,
+                })
+            end)
+
+            if built then
+                wait(seconds)
+            else
+                warn("[Notification] failed to draw")
+            end
+
+            for _, d in ipairs(created) do
+                pcall(function() d:Remove() end)
+            end
+            slots[slot] = nil
+        end)
+    end
+end
+
+local STAFF_NOTIFY = { seconds = 30, color = Color3.fromRGB(255, 80, 80) }
+local REPORT_NOTIFY = { seconds = 10, color = Color3.fromRGB(255, 170, 0) }
+
+----------------------------------------------------------------------
+-- Shared UI state (strings are only rebuilt when the value changes)
+----------------------------------------------------------------------
+local reportText, reportLabel = "N/A", "Report Count: N/A"
+local staffText, staffLabel = "None", "Staff Detected: None"
+local scanLines = { "Turn on Staff Detector to scan" }
+local modTargets = {}   -- [playerName] = true -> gets a [POSSIBLE MOD] label
+local alertedStaff = {} -- [playerName] = true -> already notified
+local knownNames, knownSet = {}, {} -- every item name seen (used by the "Print item names" button)
+
+local function setReportText(text)
+    if text ~= reportText then
+        reportText = text
+        reportLabel = "Report Count: " .. text
+    end
+end
+
+local function setStaffText(text)
+    if text ~= staffText then
+        staffText = text
+        staffLabel = "Staff Detected: " .. text
+    end
+end
+
+----------------------------------------------------------------------
+-- UI (all callbacks / ids / labels are built once, not per frame)
+----------------------------------------------------------------------
+local function printToggle(name)
+    return function(state)
+        print(name .. ": " .. tostring(state))
+    end
+end
+
+local MAIN_TOGGLES = {
+    { id = "opt_one",   label = "Staff Detector",      default = false, cb = printToggle("Staff Detector") },
+    { id = "opt_two",   label = "Report Alert",        default = false, cb = printToggle("Report Alert") },
+    { id = "opt_three", label = "Inventory Scanner",   default = true,  cb = printToggle("Inventory Scanner") },
+    { id = "opt_four",  label = "Server Loot Finder",  default = false, cb = printToggle("Server Loot Finder") },
+    { id = "opt_info",  label = "Player Info",         default = true,  cb = printToggle("Player Info") },
+    { id = "opt_inv",   label = "Inv Aim",             default = true,  cb = printToggle("Inv Aim") },
+}
+
+-- Remember every item name seen in an inventory (so you can print them and sort them into categories)
+local function registerItem(name)
+    if knownSet[name] or #knownNames >= 400 then return end
+    knownSet[name] = true
+    knownNames[#knownNames + 1] = name
+end
+
+local function printKnownItems()
+    print("---- Inv Aim: item names seen (" .. #knownNames .. ") ----")
+    for i = 1, #knownNames do
+        local n = knownNames[i]
+        print(n .. "  ->  " .. (ITEM_CATEGORY[n] or MISC))
+    end
+end
+
+-- One "Hide <category>" toggle per category (built once)
+local CATEGORY_TOGGLES = {}
+for _, cat in ipairs(CATEGORIES) do
+    local idSuffix = string.gsub(cat, " ", "_")
+    CATEGORY_TOGGLES[#CATEGORY_TOGGLES + 1] = {
+        cat = cat,
+        id = "hide_cat_" .. idSuffix,
+        label = "Hide " .. cat,
+        cb = printToggle("Hide " .. cat),
+    }
+end
+
+local LIST_TOGGLES = {}
+for i = 1, 20 do
+    LIST_TOGGLES[i] = {
+        id = "list_toggle_" .. i,
+        label = "Toggle " .. i,
+        cb = printToggle("Toggle " .. i),
+    }
+end
+
+UI.AddTab("FurryHook", function(tab)
+    local toggles = tab:Section("Toggles", "Left")
+    for _, t in ipairs(MAIN_TOGGLES) do
+        toggles:Toggle(t.id, t.label, t.default, t.cb)
+    end
+
+    local status = tab:Section("Status", "Left")
+    status:Text(reportLabel)
+    status:Text(staffLabel)
+
+    local scan = tab:Section("Server Scan", "Left", {"Players"}, 220)
+    for _, line in ipairs(scanLines) do
+        scan:Text(line)
+    end
+
+    local list = tab:Section("Toggle List", "Right", {"Toggles"}, 220)
+    for _, t in ipairs(LIST_TOGGLES) do
+        list:Toggle(t.id, t.label, false, t.cb)
+    end
+
+    -- Inv Aim filters: one toggle per category (hides its items and everything inside them)
+    local filters = tab:Section("Inv Aim Filters", "Right")
+    for _, t in ipairs(CATEGORY_TOGGLES) do
+        filters:Toggle(t.id, t.label, false, t.cb)
+    end
+    filters:Spacing()
+    filters:Button("Print item names", printKnownItems)
+end)
+
+----------------------------------------------------------------------
+-- Cached lookups
+----------------------------------------------------------------------
+local playersFolder -- ReplicatedStorage.Players, cached after first find
+
+local function getPlayersFolder()
+    if not playersFolder or playersFolder.Parent == nil then
+        playersFolder = ReplicatedStorage:FindFirstChild("Players")
+    end
+    return playersFolder
+end
+
+-- ReplicatedStorage.Players.<name>.Status.Purchases.Passes (no temp tables)
+local function getPasses(folder, name)
+    local n = folder:FindFirstChild(name)
+    n = n and n:FindFirstChild("Status")
+    n = n and n:FindFirstChild("Purchases")
+    return n and n:FindFirstChild("Passes")
+end
+
+-- Reports: ReplicatedStorage.Players.<you>.Status.UAC.Reports (count is attribute "1")
+-- Looked up fresh on every read so the attribute value is never stale
+-- (4 cheap lookups every 0.5s).
+local function readReports()
+    local folder = getPlayersFolder()
+    local n = folder and folder:FindFirstChild(LOCAL_NAME)
+    n = n and n:FindFirstChild("Status")
+    n = n and n:FindFirstChild("UAC")
+    n = n and n:FindFirstChild("Reports")
+    if not n then return nil end
+
+    local attr = n:GetAttribute("1")
+    if type(attr) == "number" then return attr end
+    return n.Value
+end
+
+local function isOn(v)
+    return v == true or v == 1
+end
+
+local function findStaffTag(passes)
+    for i = 1, #STAFF_TAGS do
+        local tag = STAFF_TAGS[i]
+        if isOn(passes:GetAttribute(tag)) then
+            return tag
+        end
+    end
+    return nil
+end
+
+----------------------------------------------------------------------
+-- Staff scan: everyone CURRENTLY in game.Players, single pass
+----------------------------------------------------------------------
+local function scanServer()
+    local folder = getPlayersFolder()
+    if not folder then
+        scanLines = { "ReplicatedStorage.Players not found" }
+        setStaffText("None")
+        modTargets = {}
+        return
+    end
+
+    local current = Players:GetPlayers()
+    local lines = { "Players in server: " .. #current }
+    local found, newMods, present = {}, {}, {}
+
+    for _, plr in ipairs(current) do
+        local name = plr.Name
+        present[name] = true
+        local isMe = (name == LOCAL_NAME)
+        local who = isMe and (name .. " (you)") or name
+        local passes = getPasses(folder, name)
+
+        if not passes then
+            lines[#lines + 1] = who .. ": no Passes found"
+        else
+            local tag = findStaffTag(passes)
+            if tag then
+                lines[#lines + 1] = who .. " -> " .. tag
+                found[#found + 1] = who .. " (" .. tag .. ")"
+
+                -- label + notification apply to other players only (you are in the list for testing)
+                if not isMe then
+                    newMods[name] = true
+                    if not alertedStaff[name] then
+                        alertedStaff[name] = true
+                        Notification.push("Staff Detector", name .. " has " .. tag, STAFF_NOTIFY)
+                        warn("[Staff Detector] " .. name .. " has " .. tag)
+                    end
+                end
+            else
+                lines[#lines + 1] = who .. ": none"
+            end
+        end
+    end
+
+    -- forget players who left so they alert again if they rejoin
+    for name in pairs(alertedStaff) do
+        if not present[name] then alertedStaff[name] = nil end
+    end
+
+    scanLines = lines
+    setStaffText((#found > 0) and table.concat(found, ", ") or "None")
+    modTargets = newMods
+end
+
+----------------------------------------------------------------------
+-- Single scheduler loop (nothing runs for a feature while it is off)
+----------------------------------------------------------------------
+local lastReports -- nil while Report Alert is off; baseline count while on
+local wasStaffOn = false
+local ticks = 0
+
+task.spawn(function()
+    while true do
+        ticks = ticks + 1
+
+        -- Report Count label (always) + Report Alert (toggle)
+        local ok, count = pcall(readReports)
+        if ok and type(count) == "number" then
+            setReportText(tostring(count))
+
+            if UI.GetValue("opt_two") then
+                if lastReports == nil then
+                    lastReports = count -- baseline when the toggle is switched on
+                elseif count > lastReports then
+                    local diff = count - lastReports
+                    lastReports = count
+                    Notification.push(
+                        "Report Alert",
+                        "You were reported! Total: " .. count .. " (+" .. diff .. ")",
+                        REPORT_NOTIFY
+                    )
+                    warn("[Report Alert] Reports = " .. count .. " (+" .. diff .. ")")
+                elseif count < lastReports then
+                    lastReports = count -- count was reset/lowered
+                end
+            else
+                lastReports = nil
+            end
+        else
+            setReportText("N/A")
+        end
+
+        -- Staff Detector (toggle): scan immediately when turned on, then every 2s
+        local staffOn = UI.GetValue("opt_one")
+        if staffOn then
+            if not wasStaffOn or ticks % STAFF_SCAN_EVERY == 0 then
+                local sok, err = pcall(scanServer)
+                if not sok then
+                    scanLines = { "Scan error: " .. tostring(err) }
+                end
+            end
+        elseif wasStaffOn then
+            -- only reset once, right after turning the toggle off
+            setStaffText("None")
+            scanLines = { "Turn on Staff Detector to scan" }
+            modTargets = {}
+            alertedStaff = {}
+        end
+        wasStaffOn = staffOn
+
+        wait(TICK_SECONDS)
+    end
+end)
+
+----------------------------------------------------------------------
+-- [POSSIBLE MOD] labels drawn over detected players
+----------------------------------------------------------------------
+local modLabels = {}        -- [playerName] = { d = Drawing, plr = Player, part = BasePart, vis = bool }
+local labelsBroken = false  -- stop retrying if Drawing rejects a property
+
+local function makeModLabel()
+    local d = Drawing.new("Text")
+    local ok = pcall(function()
+        d.Text = "[POSSIBLE MOD]"
+        d.Color = Color3.fromRGB(255, 0, 0)
+        d.Font = Drawing.Fonts.SystemBold
+        d.Size = 12
+        d.Center = true
+        d.Outline = true
+        d.Visible = false
+    end)
+    if not ok then
+        pcall(function() d:Remove() end)
+        return nil
+    end
+    return d
+end
+
+-- RenderStepped = once per rendered frame (smoother for overlays than Heartbeat)
+RunService.RenderStepped:Connect(function()
+    if labelsBroken then return end
+    -- nothing detected and nothing drawn -> no work at all
+    if next(modTargets) == nil and next(modLabels) == nil then return end
+
+    -- remove labels for players who are no longer detected / left
+    for name, e in pairs(modLabels) do
+        if not modTargets[name] then
+            pcall(function() e.d:Remove() end)
+            modLabels[name] = nil
+        end
+    end
+
+    for name in pairs(modTargets) do
+        local e = modLabels[name]
+        if not e then
+            local d = makeModLabel()
+            if not d then
+                labelsBroken = true
+                warn("[POSSIBLE MOD] could not create label")
+                return
+            end
+            e = { d = d, vis = false }
+            modLabels[name] = e
+        end
+
+        -- cached part; only re-resolved when it disappears (respawn / leave)
+        local part = e.part
+        if not part or part.Parent == nil then
+            local plr = e.plr
+            if not plr or plr.Parent == nil then
+                plr = Players:FindFirstChild(name)
+                e.plr = plr
+            end
+            local char = plr and plr.Character
+            part = char and (char:FindFirstChild("HumanoidRootPart") or char:FindFirstChild("Head"))
+            e.part = part
+        end
+
+        local d = e.d
+        if part then
+            local pos, onScreen = WorldToScreen(part.Position + LABEL_OFFSET)
+            if onScreen then
+                d.Position = Vector2.new(pos.X, pos.Y - 7)
+                if not e.vis then d.Visible = true; e.vis = true end
+            elseif e.vis then
+                d.Visible = false; e.vis = false
+            end
+        elseif e.vis then
+            d.Visible = false; e.vis = false
+        end
+    end
+end)
+
+----------------------------------------------------------------------
+-- PLAYER INFO PANEL (top-left)
+-- Shows the player closest to your screen center (within INFO_RADIUS):
+--   username, Reports, Playtime (TimePlayed seconds -> hours)
+-- Data: ReplicatedStorage.Players.<name>.Status.Journey.WipeStatistics (TimePlayed)
+--       ReplicatedStorage.Players.<name>.Status.UAC.Reports (attribute "1")
+-- Drawings are created once and reused; text is only written when it changes.
+----------------------------------------------------------------------
+local infoDrawings = {}
+local infoVisible = false
+local infoCache = { name = "", reports = "", play = "" }
+local infoName, infoReports, infoPlay
+
+local function newInfoDrawing(class, props)
+    local d = Drawing.new(class)
+    infoDrawings[#infoDrawings + 1] = d
+    for k, v in pairs(props) do
+        d[k] = v
+    end
+    return d
+end
+
+local panelOK = pcall(function()
+    local X, Y, W, H = 20, 20, 210, 114
+    local GRAY = Color3.fromRGB(190, 190, 200)
+
+    local bg = newInfoDrawing("Square", {
+        Filled = true, Color = Color3.fromRGB(22, 22, 28),
+        Position = Vector2.new(X, Y), Size = Vector2.new(W, H),
+        ZIndex = 1, Visible = false,
+    })
+    pcall(function() bg.Corner = 8 end) -- rounded corners if supported
+
+    newInfoDrawing("Square", { -- purple dot next to the title
+        Filled = true, Color = Color3.fromRGB(130, 110, 255),
+        Position = Vector2.new(X + 12, Y + 12), Size = Vector2.new(6, 6),
+        ZIndex = 2, Visible = false,
+    })
+    newInfoDrawing("Text", {
+        Text = "Player Info", Color = GRAY,
+        Font = Drawing.Fonts.System, Size = 12,
+        Position = Vector2.new(X + 24, Y + 8),
+        ZIndex = 2, Visible = false,
+    })
+    infoName = newInfoDrawing("Text", {
+        Text = "", Color = Color3.fromRGB(255, 255, 255),
+        Font = Drawing.Fonts.SystemBold, Size = 14,
+        Position = Vector2.new(X + 12, Y + 30),
+        ZIndex = 2, Visible = false,
+    })
+    newInfoDrawing("Square", { -- separator line
+        Filled = true, Color = Color3.fromRGB(80, 80, 92),
+        Position = Vector2.new(X + 12, Y + 52), Size = Vector2.new(W - 24, 1),
+        ZIndex = 2, Visible = false,
+    })
+    infoReports = newInfoDrawing("Text", {
+        Text = "", Color = GRAY,
+        Font = Drawing.Fonts.System, Size = 13,
+        Position = Vector2.new(X + 12, Y + 62),
+        ZIndex = 2, Visible = false,
+    })
+    infoPlay = newInfoDrawing("Text", {
+        Text = "", Color = GRAY,
+        Font = Drawing.Fonts.System, Size = 13,
+        Position = Vector2.new(X + 12, Y + 84),
+        ZIndex = 2, Visible = false,
+    })
+end)
+
+if not panelOK then
+    for _, d in ipairs(infoDrawings) do pcall(function() d:Remove() end) end
+    infoDrawings = {}
+    warn("[Player Info] could not create panel")
+end
+
+local function showInfoPanel(visible)
+    if visible ~= infoVisible then
+        for i = 1, #infoDrawings do
+            infoDrawings[i].Visible = visible
+        end
+        infoVisible = visible
+    end
+end
+
+local function updateInfoPanel(name, reports, play)
+    if infoCache.name ~= name then
+        infoCache.name = name
+        infoName.Text = name
+    end
+    if infoCache.reports ~= reports then
+        infoCache.reports = reports
+        infoReports.Text = reports
+    end
+    if infoCache.play ~= play then
+        infoCache.play = play
+        infoPlay.Text = play
+    end
+end
+
+-- Closest player to the screen center within INFO_RADIUS (squared compare, no sqrt)
+local function findLookedAtPlayer()
+    local view = Workspace.CurrentCamera.ViewportSize
+    local cx, cy = view.X * 0.5, view.Y * 0.5
+    local bestSq = INFO_RADIUS * INFO_RADIUS
+    local best
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        local name = plr.Name
+        if name ~= LOCAL_NAME then
+            local char = plr.Character
+            local hrp = char and char:FindFirstChild("HumanoidRootPart")
+            if hrp then
+                local pos, onScreen = WorldToScreen(hrp.Position)
+                if onScreen then
+                    local dx, dy = pos.X - cx, pos.Y - cy
+                    local sq = dx * dx + dy * dy
+                    if sq < bestSq then
+                        bestSq = sq
+                        best = name
+                    end
+                end
+            end
+        end
+    end
+    return best
+end
+
+-- Returns formatted Reports and Playtime strings ("?" when unavailable)
+local function readPlayerInfo(name)
+    local folder = getPlayersFolder()
+    local n = folder and folder:FindFirstChild(name)
+    local status = n and n:FindFirstChild("Status")
+
+    local ws = status and status:FindFirstChild("Journey")
+    ws = ws and ws:FindFirstChild("WipeStatistics")
+    local played = ws and ws:GetAttribute("TimePlayed")
+
+    local rep = status and status:FindFirstChild("UAC")
+    rep = rep and rep:FindFirstChild("Reports")
+    local reports = rep and rep:GetAttribute("1")
+
+    local reportsStr = "Reports: " .. (type(reports) == "number" and tostring(reports) or "?")
+    local playStr = "Playtime: " .. (type(played) == "number" and string.format("%.1fh", played / 3600) or "?")
+    return reportsStr, playStr
+end
+
+----------------------------------------------------------------------
+-- INV AIM PANEL (below Player Info)
+-- Shows everything inside ReplicatedStorage.Players.<name>.Inventory for the
+-- player you are looking at. Nothing is hardcoded: every item is read by
+-- whatever name it has, items that contain other items are shown as
+--   Name {
+--       inner item
+--   }
+-- and Folder objects are treated as plain containers (their contents are
+-- shown, the folder itself is not). Items are sorted into categories
+-- (see CATEGORY_ITEMS at the top; unlisted items = Miscellaneous) and each
+-- category has a "Hide" toggle that hides its items AND everything inside them.
+----------------------------------------------------------------------
+local INDENTS = { [0] = "", "   ", "      ", "         ", "            " }
+local INV_X, INV_Y, INV_W = 20, 148, 210
+local INV_ROW_H = 16
+
+local invStatic = {}        -- static drawings (box, dot, title, name, separator)
+local invLines = {}         -- pooled text rows
+local invCache = { name = "", lines = {} }
+local invLineCount = 0
+local invVisible = false
+local invBg, invName
+local invHidden = {}        -- [categoryName] = true while its "Hide" toggle is on
+
+local function newInvDrawing(list, class, props)
+    local d = Drawing.new(class)
+    list[#list + 1] = d
+    for k, v in pairs(props) do
+        d[k] = v
+    end
+    return d
+end
+
+local invOK = pcall(function()
+    local GRAY = Color3.fromRGB(190, 190, 200)
+
+    invBg = newInvDrawing(invStatic, "Square", {
+        Filled = true, Color = Color3.fromRGB(22, 22, 28),
+        Position = Vector2.new(INV_X, INV_Y), Size = Vector2.new(INV_W, 70),
+        ZIndex = 1, Visible = false,
+    })
+    pcall(function() invBg.Corner = 8 end)
+
+    newInvDrawing(invStatic, "Square", {
+        Filled = true, Color = Color3.fromRGB(130, 110, 255),
+        Position = Vector2.new(INV_X + 12, INV_Y + 12), Size = Vector2.new(6, 6),
+        ZIndex = 2, Visible = false,
+    })
+    newInvDrawing(invStatic, "Text", {
+        Text = "Inv Aim", Color = Color3.fromRGB(255, 255, 255),
+        Font = Drawing.Fonts.SystemBold, Size = 12,
+        Position = Vector2.new(INV_X + 24, INV_Y + 8),
+        ZIndex = 2, Visible = false,
+    })
+    invName = newInvDrawing(invStatic, "Text", {
+        Text = "", Color = GRAY,
+        Font = Drawing.Fonts.SystemBold, Size = 13,
+        Position = Vector2.new(INV_X + 12, INV_Y + 30),
+        ZIndex = 2, Visible = false,
+    })
+    newInvDrawing(invStatic, "Square", {
+        Filled = true, Color = Color3.fromRGB(80, 80, 92),
+        Position = Vector2.new(INV_X + 12, INV_Y + 52), Size = Vector2.new(INV_W - 24, 1),
+        ZIndex = 2, Visible = false,
+    })
+
+    for i = 1, INV_MAX_LINES do
+        invLines[i] = newInvDrawing(invStatic, "Text", {
+            Text = "", Color = GRAY,
+            Font = Drawing.Fonts.System, Size = 13,
+            Position = Vector2.new(INV_X + 12, INV_Y + 62 + (i - 1) * INV_ROW_H),
+            ZIndex = 2, Visible = false,
+        })
+    end
+end)
+
+if not invOK then
+    for _, d in ipairs(invStatic) do pcall(function() d:Remove() end) end
+    invStatic, invLines = {}, {}
+    warn("[Inv Aim] could not create panel")
+end
+
+-- static drawings = the first 5 entries; row drawings = the rest (shown only up to invLineCount)
+local INV_STATIC_COUNT = 5
+
+local function showInvPanel(visible)
+    if visible == invVisible then return end
+    for i = 1, INV_STATIC_COUNT do
+        invStatic[i].Visible = visible
+    end
+    for i = 1, invLineCount do
+        invLines[i].Visible = visible
+    end
+    invVisible = visible
+end
+
+local function setInvLineCount(n)
+    if n == invLineCount then return end
+    if invVisible then
+        for i = n + 1, invLineCount do invLines[i].Visible = false end
+        for i = invLineCount + 1, n do invLines[i].Visible = true end
+    end
+    invLineCount = n
+    invBg.Size = Vector2.new(INV_W, 70 + n * INV_ROW_H)
+end
+
+-- Reads a list of inventory children into display rows.
+-- Always walks everything (so every name gets a toggle), but only emits rows
+-- for items that are not hidden and are not inside a hidden item.
+local function collectInventory(children, depth, out, hide, state)
+    for i = 1, #children do
+        if state.count >= INV_MAX_NODES then
+            state.truncated = true
+            return
+        end
+        local c = children[i]
+        local name = c.Name
+
+        if c.ClassName == "Folder" then
+            collectInventory(c:GetChildren(), depth, out, hide, state) -- container only
+        else
+            state.count = state.count + 1
+            registerItem(name)
+
+            local hideThis = hide or invHidden[ITEM_CATEGORY[name] or MISC] == true
+            local kids = c:GetChildren()
+            local nested = #kids > 0 and depth < INV_MAX_DEPTH
+
+            if nested then
+                if not hideThis then out[#out + 1] = INDENTS[depth] .. name .. " {" end
+                collectInventory(kids, depth + 1, out, hideThis, state)
+                if not hideThis then out[#out + 1] = INDENTS[depth] .. "}" end
+            elseif not hideThis then
+                out[#out + 1] = INDENTS[depth] .. name
+            end
+        end
+    end
+end
+
+local function updateInvPanel(name)
+    local folder = getPlayersFolder()
+    local plr = folder and folder:FindFirstChild(name)
+    local inv = plr and plr:FindFirstChild("Inventory")
+
+    local out = {}
+    if not inv then
+        out[1] = "No inventory found"
+    else
+        for i = 1, #CATEGORY_TOGGLES do
+            local t = CATEGORY_TOGGLES[i]
+            invHidden[t.cat] = UI.GetValue(t.id) == true
+        end
+
+        local state = { count = 0, truncated = false }
+        collectInventory(inv:GetChildren(), 0, out, false, state)
+        if state.truncated then out[#out + 1] = "..." end
+        if #out == 0 then out[1] = "(empty)" end
+    end
+
+    -- keep within the pooled rows
+    if #out > INV_MAX_LINES then
+        local extra = #out - (INV_MAX_LINES - 1)
+        for i = #out, INV_MAX_LINES, -1 do out[i] = nil end
+        out[INV_MAX_LINES] = "... +" .. extra .. " more"
+    end
+
+    -- only write text that actually changed
+    if invCache.name ~= name then
+        invCache.name = name
+        invName.Text = name
+    end
+    local lines = invCache.lines
+    for i = 1, #out do
+        if lines[i] ~= out[i] then
+            lines[i] = out[i]
+            invLines[i].Text = out[i]
+        end
+    end
+    setInvLineCount(#out)
+end
+
+----------------------------------------------------------------------
+-- Shared step: one "looked-at player" pick feeds both panels
+----------------------------------------------------------------------
+local infoTarget, infoLastRead = nil, 0
+local invTarget, invLastRead = nil, 0
+
+local function infoStep()
+    local wantInfo = panelOK and UI.GetValue("opt_info")
+    local wantInv = invOK and UI.GetValue("opt_inv")
+    local target = (wantInfo or wantInv) and findLookedAtPlayer() or nil
+    local now = tick()
+
+    -- Player Info (re-read only when the target changes or every INFO_REFRESH seconds)
+    if wantInfo and target then
+        if target ~= infoTarget or now - infoLastRead >= INFO_REFRESH then
+            infoTarget = target
+            infoLastRead = now
+            local reportsStr, playStr = readPlayerInfo(target)
+            updateInfoPanel(target, reportsStr, playStr)
+        end
+        showInfoPanel(true)
+    else
+        infoTarget = nil
+        showInfoPanel(false)
+    end
+
+    -- Inv Aim
+    if wantInv and target then
+        if target ~= invTarget or now - invLastRead >= INFO_REFRESH then
+            invTarget = target
+            invLastRead = now
+            updateInvPanel(target)
+        end
+        showInvPanel(true)
+    else
+        invTarget = nil
+        showInvPanel(false)
+    end
+end
+
+task.spawn(function()
+    while true do
+        pcall(infoStep)
+        wait(INFO_SELECT_EVERY)
+    end
+end)
+
+print("FurryHook loaded - detected user: " .. LOCAL_NAME)
