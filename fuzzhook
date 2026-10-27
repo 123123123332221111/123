@@ -1,13 +1,24 @@
 -- Matcha LuaVM: FurryHook (draggable + transparent UI, compact text Hotbar)
+-- OPTIMIZED BUILD (local-register fix)
 -- Notes:
+--  * FIX: Lua/Luau allows max 200 locals alive in one function. The whole script
+--    used to live in one top-level chunk and went over that limit
+--    ("Out of local registers ... exceeded limit 200"). Every feature section
+--    below is now wrapped in its own `do ... end` block so its locals go out of
+--    scope when the block ends. Only shared helpers stay at the top level.
+--    Blocks report their load state through the STATUS table.
+--    RULE: if you add features, wrap them in a `do ... end` block too.
 --  * UI.AddTab's callback runs every frame, so it only reads pre-built data
 --    (no closures / string building inside it).
 --  * Username and the Players folder are resolved once and cached.
 --  * A feature does no work while its toggle is off.
---  * Every panel (Player Info, Inv Aim, Staff List, Hotbar) is draggable by its
---    top bar and uses the "UI Opacity" slider. Notifications are NOT affected.
---  * Nothing prints to the console except one line at the very end, and only
---    if everything loaded without a problem.
+--  * Every panel (Player Info, Inv Aim, Staff List, Hotbar, Server Loot) is draggable
+--    by its top bar and uses the "UI Opacity" slider. Notifications are NOT affected.
+--  * Nothing prints to the console except one line at the very end (only if
+--    everything loaded without a problem) and ONE warning if a loop hits an error.
+--  * Performance: the Server Loot scan is spread out (one player per tick, big
+--    inventories sliced across frames), dragging only moves visible drawings,
+--    and instance lookups (reports, HRPs, hotbar folder) are cached.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -18,11 +29,22 @@ local Workspace = game:GetService("Workspace")
 local LOCAL_NAME = Players.LocalPlayer.Name
 
 -- Counts errors caught while the script runs; the final "loaded" line needs this to be 0.
+-- The first caught error is also printed once as a warning so it is not hidden.
 local loadErrors = 0
+local warnedOnce = false
 local function guarded(fn)
-    local ok = pcall(fn)
-    if not ok then loadErrors = loadErrors + 1 end
+    local ok, err = pcall(fn)
+    if not ok then
+        loadErrors = loadErrors + 1
+        if not warnedOnce then
+            warnedOnce = true
+            warn("FurryHook error:", err)
+        end
+    end
 end
+
+-- Load state of each feature block (filled in by the blocks, read by the final check)
+local STATUS = {}
 
 -- Attribute names under Status.Purchases.Passes that mark someone as staff.
 local STAFF_TAGS = {
@@ -39,7 +61,9 @@ local TICK_SECONDS = 0.5       -- main loop interval
 local LABEL_OFFSET = Vector3.new(0, 3.2, 0)
 local INFO_RADIUS = 150        -- px from screen center a player must be within to count as "looked at"
 local INFO_SELECT_EVERY = 0.1  -- how often the looked-at player is re-picked (seconds)
+local INFO_IDLE_EVERY = 0.4    -- how often that loop wakes while Player Info / Inv Aim / Hotbar are all off
 local INFO_REFRESH = 2         -- how often the looked-at player's stats are re-read (seconds)
+local PLAYER_LIST_REFRESH = 1  -- how often the cached player list is refreshed (seconds)
 local INV_MAX_LINES = 26       -- max rows shown in the Inv Aim panel
 local INV_MAX_NODES = 150      -- safety cap on items read per inventory scan
 local INV_MAX_DEPTH = 4        -- how deep nested items are shown ({ } nesting)
@@ -49,11 +73,27 @@ local DEFAULT_OPACITY = 0.85   -- starting value of the "UI Opacity" slider (1 =
 local DRAG_HEADER_H = 24       -- px: top strip of each panel that grabs the mouse
 local MOUSE_Y_OFFSET = 0       -- if panels jump ~36px when you grab them, set this to -36 (or 36)
 
+-- The 20 placeholder "Toggle 1-20" switches cost UI work every frame.
+-- Set to true if you want the placeholder "Toggle List" section back.
+local SHOW_TOGGLE_LIST = false
+
 -- Hotbar panel
 local HOTBAR_REFRESH = 0.5     -- seconds between hotbar re-reads
 local HOTBAR_SLOTS = { "ItemBack1", "ItemBack2", "Hotbar4", "Hotbar5", "Hotbar6", "Hotbar7", "Hotbar8" }
 local HOTBAR_KEYS  = { "B1", "B2", "4", "5", "6", "7", "8" } -- little label in each slot's corner
 local HOTBAR_MODES = { "Looked at player", "Myself" }        -- "Hotbar Target" dropdown
+
+-- Server Loot panel
+local LOOT_REFRESH = 8          -- seconds for one full pass over the server (players are scanned one at a time)
+local LOOT_MAX_NODES = 2000     -- safety cap on inventory objects looked at per player
+local LOOT_SLICE = 400          -- inventory objects read per frame before yielding
+local LOOT_MAX_ROWS = 50        -- max text rows in the panel (extra rows become "... +N more")
+local LOOT_INCLUDE_SELF = true  -- also list your own loot
+-- EXACT item names the scanner counts (order here = order shown under each player)
+local LOOT_ITEMS = {
+    "FlareGun", "Reapir", "SOCOM556", "PEQ15", "HSPV", "TitanShield", "Mag556Rnd100",
+    "TFZ98S", "CatToken", "ThermalModule", "R700", "338AP", "Gold50g",
+}
 
 -- Inv Aim item list. Only items written here are ever shown; anything else in an
 -- inventory (e.g. a shirt that isn't listed) is ignored.
@@ -367,7 +407,7 @@ end
 local MAIN_TOGGLES = {
     { id = "opt_two",   label = "Report Alert",        default = false, cb = printToggle("Report Alert") },
     { id = "opt_three", label = "Inventory Scanner",   default = true,  cb = printToggle("Inventory Scanner") },
-    { id = "opt_four",  label = "Server Loot Finder",  default = false, cb = printToggle("Server Loot Finder") },
+    { id = "opt_four",  label = "Server Loot Scanner", default = true,  cb = printToggle("Server Loot Scanner") },
     { id = "opt_info",  label = "Player Info",         default = true,  cb = printToggle("Player Info") },
     { id = "opt_inv",   label = "Inv Aim",             default = true,  cb = printToggle("Inv Aim") },
     { id = "opt_hotbar", label = "Hotbar",             default = true,  cb = printToggle("Hotbar") },
@@ -387,13 +427,20 @@ for _, cat in ipairs(CATEGORIES) do
 end
 
 local LIST_TOGGLES = {}
-for i = 1, 20 do
-    LIST_TOGGLES[i] = {
-        id = "list_toggle_" .. i,
-        label = "Toggle " .. i,
-        cb = printToggle("Toggle " .. i),
-    }
+if SHOW_TOGGLE_LIST then
+    for i = 1, 20 do
+        LIST_TOGGLES[i] = {
+            id = "list_toggle_" .. i,
+            label = "Toggle " .. i,
+            cb = printToggle("Toggle " .. i),
+        }
+    end
 end
+
+-- Counts hoisted out of the per-frame tab callback
+local N_MAIN = #MAIN_TOGGLES
+local N_CAT = #CATEGORY_TOGGLES
+local N_LIST = #LIST_TOGGLES
 
 -- Assigned further down (needs the panels to exist); the button callback is built once here.
 local resetPanels
@@ -403,7 +450,8 @@ end
 
 UI.AddTab("FurryHook", function(tab)
     local toggles = tab:Section("Toggles", "Left")
-    for _, t in ipairs(MAIN_TOGGLES) do
+    for i = 1, N_MAIN do
+        local t = MAIN_TOGGLES[i]
         toggles:Toggle(t.id, t.label, t.default, t.cb)
     end
 
@@ -416,14 +464,18 @@ UI.AddTab("FurryHook", function(tab)
     iface:Button("Reset UI Positions", onResetClick)
     iface:Text("Drag a panel by its top bar")
 
-    local list = tab:Section("Toggle List", "Right", {"Toggles"}, 220)
-    for _, t in ipairs(LIST_TOGGLES) do
-        list:Toggle(t.id, t.label, false, t.cb)
+    if N_LIST > 0 then
+        local list = tab:Section("Toggle List", "Right", {"Toggles"}, 220)
+        for i = 1, N_LIST do
+            local t = LIST_TOGGLES[i]
+            list:Toggle(t.id, t.label, false, t.cb)
+        end
     end
 
     -- Inv Aim filters: one toggle per category (hides its items and everything inside them)
     local filters = tab:Section("Inv Aim Filters", "Right", {"Categories"}, 300)
-    for _, t in ipairs(CATEGORY_TOGGLES) do
+    for i = 1, N_CAT do
+        local t = CATEGORY_TOGGLES[i]
         filters:Toggle(t.id, t.label, false, t.cb)
     end
 end)
@@ -449,19 +501,22 @@ local function getPasses(folder, name)
 end
 
 -- Reports: ReplicatedStorage.Players.<you>.Status.UAC.Reports (count is attribute "1")
--- Looked up fresh on every read so the attribute value is never stale
--- (4 cheap lookups every 0.5s).
+-- The Reports instance is cached (re-found only if it disappears); the attribute
+-- itself is read live every call, so the value is never stale.
+local reportsInst
 local function readReports()
-    local folder = getPlayersFolder()
-    local n = folder and folder:FindFirstChild(LOCAL_NAME)
-    n = n and n:FindFirstChild("Status")
-    n = n and n:FindFirstChild("UAC")
-    n = n and n:FindFirstChild("Reports")
-    if not n then return nil end
+    if not reportsInst or reportsInst.Parent == nil then
+        local folder = getPlayersFolder()
+        local n = folder and folder:FindFirstChild(LOCAL_NAME)
+        n = n and n:FindFirstChild("Status")
+        n = n and n:FindFirstChild("UAC")
+        reportsInst = n and n:FindFirstChild("Reports")
+    end
+    if not reportsInst then return nil end
 
-    local attr = n:GetAttribute("1")
+    local attr = reportsInst:GetAttribute("1")
     if type(attr) == "number" then return attr end
-    return n.Value
+    return reportsInst.Value
 end
 
 local function isOn(v)
@@ -479,11 +534,14 @@ local function findStaffTag(passes)
 end
 
 ----------------------------------------------------------------------
--- PANEL SYSTEM (shared by Player Info, Inv Aim, Hotbar, Staff List)
+-- PANEL SYSTEM (shared by Player Info, Inv Aim, Hotbar, Staff List, Server Loot)
 -- Every drawing in a panel is registered with an offset from the panel's
 -- origin, so moving a panel = rewriting each drawing's Position once.
 --   * bg drawings use the UI Opacity value, text uses it + 0.1
 --   * panel.bottom = true means panel.y is the BOTTOM edge (panel grows upward)
+--   * panel.active = how many drawings (from the start of p.items) are in use.
+--     Pooled rows beyond that are hidden, so moving the panel skips them.
+--     When the row count grows, placePanel is called so new rows get positioned.
 -- NOTE: Drawing.Transparency is assumed to be 1 = solid, 0 = invisible
 -- (Roblox convention). If the slider behaves backwards, change bgAlpha() and
 -- fgAlpha() below to return 1 - value.
@@ -508,6 +566,7 @@ local function newPanel(id, x, y, w, h, bottom)
         w = w, h = h,
         bottom = bottom or false,
         items = {},         -- { d = Drawing, ox = number, oy = number, bg = bool }
+        active = nil,       -- nil = every item is in use
         shown = false,
     }
     panels[#panels + 1] = p
@@ -519,13 +578,16 @@ local function panelTop(p)
     return p.y
 end
 
--- Writes every drawing's Position from the panel origin (only called on move / re-layout)
+-- Writes the in-use drawings' Position from the panel origin (only called on move / re-layout)
 local function placePanel(p)
     local top = panelTop(p)
     local items = p.items
-    for i = 1, #items do
+    local px = p.x
+    local n = p.active or #items
+    if n > #items then n = #items end
+    for i = 1, n do
         local it = items[i]
-        it.d.Position = Vector2.new(p.x + it.ox, top + it.oy)
+        it.d.Position = Vector2.new(px + it.ox, top + it.oy)
     end
 end
 
@@ -587,6 +649,7 @@ end
 ----------------------------------------------------------------------
 -- Report loop (Report Count label always, Report Alert while its toggle is on)
 ----------------------------------------------------------------------
+do -- BLOCK: report loop
 local lastReports -- nil while Report Alert is off; baseline count while on
 
 task.spawn(function()
@@ -622,13 +685,15 @@ task.spawn(function()
         wait(TICK_SECONDS)
     end
 end)
+end -- BLOCK: report loop
 
 ----------------------------------------------------------------------
 -- [POSSIBLE MOD] labels drawn over detected players
 -- (world overlay, not a panel: left opaque and not draggable)
 ----------------------------------------------------------------------
+do -- BLOCK: mod labels
 local modLabels = {}        -- [playerName] = { d = Drawing, plr = Player, part = BasePart, vis = bool }
-local labelsBroken = false  -- stop retrying if Drawing rejects a property
+STATUS.labelsBroken = false -- set to true if Drawing rejects a property (stops retrying)
 
 local function makeModLabel()
     local d = Drawing.new("Text")
@@ -650,7 +715,7 @@ end
 
 -- RenderStepped = once per rendered frame (smoother for overlays than Heartbeat)
 RunService.RenderStepped:Connect(function()
-    if labelsBroken then return end
+    if STATUS.labelsBroken then return end
     -- nothing detected and nothing drawn -> no work at all
     if next(modTargets) == nil and next(modLabels) == nil then return end
 
@@ -667,7 +732,7 @@ RunService.RenderStepped:Connect(function()
         if not e then
             local d = makeModLabel()
             if not d then
-                labelsBroken = true
+                STATUS.labelsBroken = true
                 return
             end
             e = { d = d, vis = false }
@@ -701,6 +766,12 @@ RunService.RenderStepped:Connect(function()
         end
     end
 end)
+end -- BLOCK: mod labels
+
+----------------------------------------------------------------------
+-- PLAYER INFO + INV AIM + HOTBAR (one block: they share the "looked-at player" step)
+----------------------------------------------------------------------
+do -- BLOCK: player info / inv aim / hotbar
 
 ----------------------------------------------------------------------
 -- PLAYER INFO PANEL (top-left by default)
@@ -781,18 +852,43 @@ local function updateInfoPanel(name, reports, play)
     end
 end
 
+-- Cached player list + HumanoidRootParts for the "looked at" pick.
+-- The list is refreshed every PLAYER_LIST_REFRESH seconds (GetPlayers allocates a
+-- new table each call) and the HRP cache is keyed by NAME (stable) and cleared
+-- on each refresh so players who left drop out.
+local hrpCache = {}
+local plrList, plrListAt = {}, -100
+
+local function getPlayerList(now)
+    if now - plrListAt >= PLAYER_LIST_REFRESH then
+        plrList = Players:GetPlayers()
+        plrListAt = now
+        hrpCache = {}
+    end
+    return plrList
+end
+
 -- Closest player to the screen center within INFO_RADIUS (squared compare, no sqrt)
-local function findLookedAtPlayer()
+local function findLookedAtPlayer(now)
     local view = Workspace.CurrentCamera.ViewportSize
     local cx, cy = view.X * 0.5, view.Y * 0.5
     local bestSq = INFO_RADIUS * INFO_RADIUS
     local best
 
-    for _, plr in ipairs(Players:GetPlayers()) do
+    local list = getPlayerList(now)
+    for i = 1, #list do
+        local plr = list[i]
         local name = plr.Name
         if name ~= LOCAL_NAME then
-            local char = plr.Character
-            local hrp = char and char:FindFirstChild("HumanoidRootPart")
+            local hrp = hrpCache[name]
+            if not hrp or hrp.Parent == nil then
+                hrp = nil
+                if plr.Parent ~= nil then
+                    local char = plr.Character
+                    hrp = char and char:FindFirstChild("HumanoidRootPart")
+                end
+                hrpCache[name] = hrp
+            end
             if hrp then
                 local pos, onScreen = WorldToScreen(hrp.Position)
                 if onScreen then
@@ -852,6 +948,8 @@ local invLineCount = 0
 local invVisible = false
 local invBg, invName
 local invHidden = {}        -- [categoryName] = true while its "Hide" toggle is on
+local invOut = {}           -- reused row buffer (cleared each scan instead of reallocated)
+local invState = { count = 0, truncated = false }
 
 local invOK = pcall(function()
     local GRAY = Color3.fromRGB(190, 190, 200)
@@ -898,6 +996,7 @@ if not invOK then
 end
 
 local INV_STATIC_COUNT = 5
+invPanel.active = INV_STATIC_COUNT -- only the 5 static drawings until rows appear
 
 local function showInvPanel(visible)
     if visible == invVisible then return end
@@ -920,6 +1019,8 @@ local function setInvLineCount(n)
     invLineCount = n
     invPanel.h = 70 + n * INV_ROW_H
     invBg.Size = Vector2.new(INV_W, invPanel.h)
+    invPanel.active = INV_STATIC_COUNT + n
+    placePanel(invPanel) -- positions any newly used rows (they may have been left behind by a drag)
 end
 
 -- An item is shown if it is in the list AND at least one of its categories
@@ -978,7 +1079,9 @@ local function updateInvPanel(name)
     local plr = folder and folder:FindFirstChild(name)
     local inv = plr and plr:FindFirstChild("Inventory")
 
-    local out = {}
+    local out = invOut
+    for i = #out, 1, -1 do out[i] = nil end -- clear the reused buffer
+
     if not inv then
         out[1] = "No inventory found"
     else
@@ -987,7 +1090,9 @@ local function updateInvPanel(name)
             invHidden[t.cat] = UI.GetValue(t.id) == true
         end
 
-        local state = { count = 0, truncated = false }
+        local state = invState
+        state.count = 0
+        state.truncated = false
         collectInventory(inv:GetChildren(), 0, out, state)
         if state.truncated then out[#out + 1] = "..." end
         if #out == 0 then out[1] = "(nothing to show)" end
@@ -1133,14 +1238,22 @@ local function setSlotItem(i, item)
     applySlot(i)
 end
 
+-- The Hotbar folder is cached per target (re-found when the target changes or it disappears)
+local hbFolderName, hbFolder
+
 -- Reads the 7 slots into out[1..7] ("" = empty / not a listed item)
 -- Returns false if the Hotbar folder could not be found.
 local function readHotbar(name, out)
-    local folder = getPlayersFolder()
-    local n = folder and folder:FindFirstChild(name)
-    n = n and n:FindFirstChild("Status")
-    n = n and n:FindFirstChild("GameplayVariables")
-    n = n and n:FindFirstChild("Hotbar")
+    if hbFolderName ~= name or not hbFolder or hbFolder.Parent == nil then
+        local folder = getPlayersFolder()
+        local n = folder and folder:FindFirstChild(name)
+        n = n and n:FindFirstChild("Status")
+        n = n and n:FindFirstChild("GameplayVariables")
+        n = n and n:FindFirstChild("Hotbar")
+        hbFolder = n
+        hbFolderName = name
+    end
+    local n = hbFolder
 
     for i = 1, HB_COUNT do
         local item = ""
@@ -1187,9 +1300,12 @@ end
 
 ----------------------------------------------------------------------
 -- Shared step: one "looked-at player" pick feeds all panels
+-- Returns true while any of Player Info / Inv Aim / Hotbar is on, so the loop
+-- can sleep longer when nothing is active.
 ----------------------------------------------------------------------
 local infoTarget, infoLastRead = nil, 0
 local invTarget, invLastRead = nil, 0
+local invPending -- target seen once; Inv Aim only scans after it is stable for a second tick
 
 local function infoStep()
     local wantInfo = panelOK and UI.GetValue("opt_info")
@@ -1197,9 +1313,9 @@ local function infoStep()
     local wantHotbar = hbOK and UI.GetValue("opt_hotbar")
     local hbSelf = UI.GetValue("hotbar_target") == 1
 
-    local needLook = wantInfo or wantInv or (wantHotbar and not hbSelf)
-    local target = needLook and findLookedAtPlayer() or nil
     local now = tick()
+    local needLook = wantInfo or wantInv or (wantHotbar and not hbSelf)
+    local target = needLook and findLookedAtPlayer(now) or nil
 
     -- Player Info (re-read only when the target changes or every INFO_REFRESH seconds)
     if wantInfo and target then
@@ -1215,15 +1331,24 @@ local function infoStep()
         showInfoPanel(false)
     end
 
-    -- Inv Aim
+    -- Inv Aim (debounced: sweeping the crosshair across players doesn't scan every one)
     if wantInv and target then
-        if target ~= invTarget or now - invLastRead >= INFO_REFRESH then
-            invTarget = target
+        if target ~= invTarget then
+            if invPending ~= target then
+                invPending = target -- first sighting, wait one more tick
+            else
+                invPending = nil
+                invTarget = target
+                invLastRead = now
+                updateInvPanel(target)
+            end
+        elseif now - invLastRead >= INFO_REFRESH then
             invLastRead = now
             updateInvPanel(target)
         end
-        showInvPanel(true)
+        showInvPanel(invTarget ~= nil)
     else
+        invPending = nil
         invTarget = nil
         showInvPanel(false)
     end
@@ -1234,14 +1359,27 @@ local function infoStep()
     else
         hotbarStep(nil, now)
     end
+
+    return (wantInfo or wantInv or wantHotbar) and true or false
 end
 
 task.spawn(function()
     while true do
-        guarded(infoStep)
-        wait(INFO_SELECT_EVERY)
+        local ok, active = pcall(infoStep)
+        if not ok then
+            loadErrors = loadErrors + 1
+            if not warnedOnce then
+                warnedOnce = true
+                warn("FurryHook error:", active)
+            end
+        end
+        wait(active == true and INFO_SELECT_EVERY or INFO_IDLE_EVERY)
     end
 end)
+
+-- report this block's load state to the final check
+STATUS.panelOK, STATUS.invOK, STATUS.hbOK = panelOK, invOK, hbOK
+end -- BLOCK: player info / inv aim / hotbar
 
 ----------------------------------------------------------------------
 -- STAFF LIST PANEL (bottom-left by default)
@@ -1255,15 +1393,18 @@ end)
 -- notification box.
 -- The panel is bottom-anchored: it grows upward as names are added.
 ----------------------------------------------------------------------
+do -- BLOCK: staff list
 local STAFF_LIST_INCLUDE_SELF = true -- TEST: lets you see yourself in the list; set to false later
 local SL_MAX_ROWS = 10
 local SL_ROW_H = 16
 local SL_X, SL_W, SL_MARGIN = 20, 210, 20
 local SL_MAX_TRIES = 20
+local SL_STATIC_COUNT = 5 -- bg, dot, title, count, separator
 
 local staffSet = {}      -- [name] = true -> has a staff tag
 local staffChecked = {}  -- [name] = true -> Passes already read for this player
 local staffPending = {}  -- [name] = tries -> waiting for their Passes to exist
+local staffPresent = {}  -- reused each sync instead of allocating a new table
 local staffDirty = true
 local staffWasOn = false
 
@@ -1313,6 +1454,8 @@ if not slOK then
     slRows = {}
 end
 
+slPanel.active = SL_STATIC_COUNT -- grows with the number of names shown
+
 -- Panel height follows the number of names; positions are only rewritten when the list changes.
 local function layoutStaffPanel(n, total)
     -- title row, then (only when staff is detected) "Staff Detected (x)", separator and names
@@ -1334,6 +1477,7 @@ local function layoutStaffPanel(n, total)
         slRows[i].Visible = (i <= n)
     end
 
+    slPanel.active = SL_STATIC_COUNT + n
     placePanel(slPanel) -- bottom edge stays put, so the panel grows upward
 end
 
@@ -1408,9 +1552,12 @@ end
 
 -- Scans game.Players: queues players we have not checked yet, drops ones that are gone
 local function syncStaff()
-    local present = {}
-    for _, plr in ipairs(Players:GetPlayers()) do
-        local name = plr.Name
+    local present = staffPresent
+    for k in pairs(present) do present[k] = nil end -- reuse the table
+
+    local list = Players:GetPlayers()
+    for i = 1, #list do
+        local name = list[i].Name
         present[name] = true
         if not staffChecked[name] and staffPending[name] == nil then
             staffPending[name] = 0
@@ -1462,9 +1609,299 @@ task.spawn(function()
     end
 end)
 
+STATUS.slOK = slOK
+end -- BLOCK: staff list
+
+----------------------------------------------------------------------
+-- SERVER LOOT SCANNER PANEL (right side by default)
+-- A pass over the server takes about LOOT_REFRESH seconds: players still in
+-- game.Players that also exist in ReplicatedStorage.Players are scanned ONE
+-- PER TICK, and a big inventory is read in slices of LOOT_SLICE objects with a
+-- yield between slices, so no single frame ever does a huge amount of work.
+-- Every LOOT_ITEMS match anywhere inside their Inventory is counted (also when
+-- it sits inside clothing, bags or other items). The panel is redrawn when a
+-- full pass finishes. Only players that have at least one of the items are
+-- listed:
+--   PlayerName
+--     R700
+--     338AP (32x)
+-- "(Nx)" is only written when a player has more than one of that item.
+-- Each inventory object with a matching name counts as one.
+----------------------------------------------------------------------
+do -- BLOCK: server loot
+local LOOT_W = 200
+local LOOT_ROW_H = 14
+local LOOT_ROW_Y = 28
+local LOOT_STATIC_COUNT = 3 -- bg, dot, title
+
+local LOOT_SET = {} -- [itemName] = position in LOOT_ITEMS
+for i = 1, #LOOT_ITEMS do
+    LOOT_SET[LOOT_ITEMS[i]] = i
+end
+
+local lootView = Workspace.CurrentCamera.ViewportSize
+local lootPanel = newPanel("loot", math.floor(lootView.X - LOOT_W - 20), 20, LOOT_W, 36)
+local lootStatic = {}       -- bg, dot, title
+local lootRows = {}         -- pooled text rows
+local lootRowText, lootRowKind = {}, {}
+local lootRowCount = 0
+local lootVisible = false
+local lootBg, lootTitle
+local lootTitleText = ""
+local lootLastScan = 0
+
+local LOOT_WHITE = Color3.fromRGB(255, 255, 255)
+local LOOT_GRAY = Color3.fromRGB(190, 190, 200)
+
+local lootOK = pcall(function()
+    lootBg = addItem(lootPanel, "Square", {
+        Filled = true, Color = Color3.fromRGB(22, 22, 28),
+        Size = Vector2.new(LOOT_W, 36), ZIndex = 1, Visible = false,
+    }, 0, 0, true)
+    pcall(function() lootBg.Corner = 8 end)
+    lootStatic[1] = lootBg
+
+    lootStatic[2] = addItem(lootPanel, "Square", {
+        Filled = true, Color = Color3.fromRGB(130, 110, 255),
+        Size = Vector2.new(6, 6), ZIndex = 2, Visible = false,
+    }, 12, 12)
+    lootTitle = addItem(lootPanel, "Text", {
+        Text = "Server Loot", Color = LOOT_WHITE,
+        Font = Drawing.Fonts.SystemBold, Size = 12,
+        ZIndex = 2, Visible = false,
+    }, 24, 8)
+    lootStatic[3] = lootTitle
+
+    for i = 1, LOOT_MAX_ROWS do
+        lootRows[i] = addItem(lootPanel, "Text", {
+            Text = "", Color = LOOT_GRAY,
+            Font = Drawing.Fonts.System, Size = 12,
+            ZIndex = 2, Visible = false,
+        }, 12, LOOT_ROW_Y + (i - 1) * LOOT_ROW_H)
+        lootRowKind[i] = 2 -- 1 = player name row, 2 = item row
+    end
+end)
+
+if not lootOK then
+    destroyPanel(lootPanel)
+    lootStatic, lootRows = {}, {}
+end
+
+lootPanel.active = LOOT_STATIC_COUNT -- grows with the number of rows shown
+
+local function showLoot(visible)
+    if visible == lootVisible then return end
+    for i = 1, #lootStatic do
+        lootStatic[i].Visible = visible
+    end
+    for i = 1, lootRowCount do
+        lootRows[i].Visible = visible
+    end
+    lootVisible = visible
+    lootPanel.shown = visible
+end
+
+-- Names of players that are still in the server AND exist in ReplicatedStorage.Players
+local function lootGetNames(out)
+    local folder = getPlayersFolder()
+    if not folder then return end
+    local list = Players:GetPlayers()
+    for i = 1, #list do
+        local name = list[i].Name
+        if (LOOT_INCLUDE_SELF or name ~= LOCAL_NAME) and folder:FindFirstChild(name) then
+            out[#out + 1] = name
+        end
+    end
+    table.sort(out)
+end
+
+-- Returns the descendants of one player's Inventory (nil if there is none)
+local function lootGetDesc(name)
+    local folder = getPlayersFolder()
+    local plr = folder and folder:FindFirstChild(name)
+    local inv = plr and plr:FindFirstChild("Inventory")
+    return inv and inv:GetDescendants()
+end
+
+-- Counts LOOT_ITEMS in desc[from..to] into counts. Returns true if anything matched.
+local function lootScanSlice(desc, from, to, counts)
+    local found = false
+    for i = from, to do
+        local idx = LOOT_SET[desc[i].Name]
+        if idx then
+            counts[idx] = (counts[idx] or 0) + 1
+            found = true
+        end
+    end
+    return found
+end
+
+-- Counts the LOOT_ITEMS inside one player's Inventory, a slice at a time.
+-- Returns nil if they have none. counts[i] = amount of LOOT_ITEMS[i].
+-- The yield between slices is OUTSIDE pcall on purpose.
+local function lootScanPlayer(name)
+    local ok, desc = pcall(lootGetDesc, name)
+    if not ok then
+        loadErrors = loadErrors + 1
+        return nil
+    end
+    if not desc then return nil end
+
+    local limit = #desc
+    if limit > LOOT_MAX_NODES then limit = LOOT_MAX_NODES end
+
+    local counts, found, from = {}, false, 1
+    while from <= limit do
+        local to = from + LOOT_SLICE - 1
+        if to > limit then to = limit end
+
+        local ok2, hit = pcall(lootScanSlice, desc, from, to, counts)
+        if not ok2 then
+            loadErrors = loadErrors + 1
+        elseif hit then
+            found = true
+        end
+
+        from = to + 1
+        if from <= limit then task.wait() end -- let the game render before the next slice
+    end
+
+    if found then return counts end
+    return nil
+end
+
+-- results[i] = { name = playerName, counts = { [itemIndex] = amount } }
+local function renderLoot(results)
+    local texts, kinds = {}, {}
+    for i = 1, #results do
+        local r = results[i]
+        texts[#texts + 1] = r.name
+        kinds[#kinds + 1] = 1
+        for idx = 1, #LOOT_ITEMS do
+            local c = r.counts[idx]
+            if c then
+                if c > 1 then
+                    texts[#texts + 1] = "  " .. LOOT_ITEMS[idx] .. " (" .. c .. "x)"
+                else
+                    texts[#texts + 1] = "  " .. LOOT_ITEMS[idx]
+                end
+                kinds[#kinds + 1] = 2
+            end
+        end
+    end
+    if #texts == 0 then
+        texts[1] = "No loot found"
+        kinds[1] = 2
+    end
+
+    -- keep within the pooled rows
+    if #texts > LOOT_MAX_ROWS then
+        local extra = #texts - (LOOT_MAX_ROWS - 1)
+        for i = #texts, LOOT_MAX_ROWS, -1 do
+            texts[i] = nil
+            kinds[i] = nil
+        end
+        texts[LOOT_MAX_ROWS] = "... +" .. extra .. " more"
+        kinds[LOOT_MAX_ROWS] = 2
+    end
+
+    -- only write what changed
+    local n = #texts
+    for i = 1, n do
+        if lootRowText[i] ~= texts[i] then
+            lootRowText[i] = texts[i]
+            lootRows[i].Text = texts[i]
+        end
+        if lootRowKind[i] ~= kinds[i] then
+            lootRowKind[i] = kinds[i]
+            if kinds[i] == 1 then
+                lootRows[i].Font = Drawing.Fonts.SystemBold
+                lootRows[i].Color = LOOT_WHITE
+            else
+                lootRows[i].Font = Drawing.Fonts.System
+                lootRows[i].Color = LOOT_GRAY
+            end
+        end
+    end
+
+    if n ~= lootRowCount then
+        if lootVisible then
+            for i = n + 1, lootRowCount do lootRows[i].Visible = false end
+            for i = lootRowCount + 1, n do lootRows[i].Visible = true end
+        end
+        lootRowCount = n
+        lootPanel.h = LOOT_ROW_Y + n * LOOT_ROW_H + 8
+        lootBg.Size = Vector2.new(LOOT_W, lootPanel.h)
+        lootPanel.active = LOOT_STATIC_COUNT + n
+        placePanel(lootPanel) -- positions any newly used rows (they may have been left behind by a drag)
+    end
+
+    local title = "Server Loot (" .. #results .. ")"
+    if title ~= lootTitleText then
+        lootTitleText = title
+        lootTitle.Text = title
+    end
+end
+
+-- Round-robin worker: one player per tick, results cached per player and the
+-- panel redrawn when a full pass completes.
+local lootCache = {}        -- [name] = counts table, or false when the player has none
+local lootQueue = {}        -- names for the current pass
+local lootPos = 1           -- next index in lootQueue
+local lootDirty = false     -- a pass finished and the panel has not been redrawn yet
+
+task.spawn(function()
+    while true do
+        local sleep = 0.5
+        if lootOK and UI.GetValue("opt_four") then
+            showLoot(true)
+
+            -- start a new pass when the previous one is done and the refresh time has passed
+            if lootPos > #lootQueue and tick() - lootLastScan >= LOOT_REFRESH then
+                lootLastScan = tick()
+
+                local names = {}
+                if not pcall(lootGetNames, names) then loadErrors = loadErrors + 1 end
+                lootQueue, lootPos, lootDirty = names, 1, true
+
+                -- drop cached players who left
+                local keep = {}
+                for i = 1, #names do keep[names[i]] = true end
+                for name in pairs(lootCache) do
+                    if not keep[name] then lootCache[name] = nil end
+                end
+            end
+
+            if lootPos <= #lootQueue then
+                local name = lootQueue[lootPos]
+                lootPos = lootPos + 1
+                lootCache[name] = lootScanPlayer(name) or false
+                sleep = clamp(LOOT_REFRESH / #lootQueue, 0.05, 0.5)
+            elseif lootDirty then
+                lootDirty = false
+                local results = {}
+                for i = 1, #lootQueue do
+                    local c = lootCache[lootQueue[i]]
+                    if c then results[#results + 1] = { name = lootQueue[i], counts = c } end
+                end
+                guarded(function() renderLoot(results) end)
+            end
+        else
+            showLoot(false)
+            lootLastScan = 0 -- start a pass right away when it is switched back on
+            lootQueue, lootPos, lootCache, lootDirty = {}, 1, {}, false
+        end
+        wait(sleep)
+    end
+end)
+
+STATUS.lootOK = lootOK
+end -- BLOCK: server loot
+
 ----------------------------------------------------------------------
 -- UI OPACITY (slider in the Interface section; applied only when it changes)
 ----------------------------------------------------------------------
+do -- BLOCK: ui opacity
 local function opacityStep()
     local v = UI.GetValue("ui_opacity")
     if type(v) == "number" and v ~= uiOpacity then
@@ -1476,16 +1913,18 @@ end
 task.spawn(function()
     while true do
         guarded(opacityStep)
-        wait(0.2)
+        wait(0.25)
     end
 end)
+end -- BLOCK: ui opacity
 
 ----------------------------------------------------------------------
 -- DRAGGING
 -- Hold the left mouse button on a panel's top bar (DRAG_HEADER_H px) and move.
 -- Panels are clamped to the screen. Positions reset on re-execute (or with the
--- "Reset UI Positions" button).
+-- "Reset UI Positions" button). Only the drawings currently in use are moved.
 ----------------------------------------------------------------------
+do -- BLOCK: dragging
 local dragMouse = Players.LocalPlayer:GetMouse()
 local dragPanel, dragOX, dragOY = nil, 0, 0
 local dragWasDown = false
@@ -1532,20 +1971,23 @@ end
 RunService.RenderStepped:Connect(function()
     guarded(dragStep)
 end)
+end -- BLOCK: dragging
 
 ----------------------------------------------------------------------
 -- LOAD CHECK
--- The one and only console line. It waits 2 seconds so every background loop
--- has run at least once, then prints only if all panels were created, the
+-- The one and only normal console line. It waits 2 seconds so every background
+-- loop has run at least once, then prints only if all panels were created, the
 -- game data folder was found, and no error was caught anywhere.
+-- (If an error IS caught, the first one is printed once as a warning.)
 ----------------------------------------------------------------------
 task.spawn(function()
     wait(2)
-    local allGood = panelOK and invOK and hbOK and slOK
-        and not labelsBroken
+    local allGood = STATUS.panelOK and STATUS.invOK and STATUS.hbOK
+        and STATUS.slOK and STATUS.lootOK
+        and not STATUS.labelsBroken
         and getPlayersFolder() ~= nil
         and loadErrors == 0
     if allGood then
-        print("FuzzHook has loaded without any errors")
+        print("FurryHook has loaded without any errors")
     end
 end)
