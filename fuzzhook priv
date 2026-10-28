@@ -624,6 +624,37 @@ local function addToggleSection(tab, title, side, list)
     end
 end
 
+-- "Print Most Wanted" button: only scans ReplicatedStorage.ReportList.MostWanted when clicked.
+-- Each child is named "<username>_<userid>" and holds the report count in attribute "1".
+local function onMostWantedClick()
+    local ok, err = pcall(function()
+        local list = ReplicatedStorage:FindFirstChild("ReportList")
+        list = list and list:FindFirstChild("MostWanted")
+        if not list then
+            print("[Most Wanted] list not found")
+            return
+        end
+
+        local kids = list:GetChildren()
+        if #kids == 0 then
+            print("[Most Wanted] list is empty")
+            return
+        end
+
+        print("[Most Wanted] " .. #kids .. " players:")
+        for i = 1, #kids do
+            local kid = kids[i]
+            -- strip the trailing "_<userid>" (usernames can contain underscores too)
+            local username = string.match(kid.Name, "^(.*)_%d+$") or kid.Name
+            local reports = kid:GetAttribute("1")
+            print(username .. " - " .. (type(reports) == "number" and tostring(reports) or "?") .. " reports")
+        end
+    end)
+    if not ok then
+        print("[Most Wanted] error: " .. tostring(err))
+    end
+end
+
 -- Title of the bottom-right section (built once, not per frame).
 -- If the menu font cannot draw the emoji and shows boxes / "?", swap them for "/!\" here.
 local DEBUG_TITLE = "\u{26A0}\u{FE0F} Debug Options \u{26A0}\u{FE0F}"
@@ -634,6 +665,12 @@ UI.AddTab("FuzzyHook - PRIVATE", function(tab)
     addToggleSection(tab, "Server Toggles", "Left", SERVER_TOGGLES)
     addToggleSection(tab, "Inventory Toggles", "Left", INVENTORY_TOGGLES)
 
+    -- World Toggles: Dropped Item ESP (no functionality yet: only the toggle, keybind and range slider)
+    local world = tab:Section("World Toggles", "Left")
+    world:Toggle("opt_dropesp", "Dropped Item ESP", false)
+    world:Keybind("opt_dropesp_kb", 0, "toggle") -- unbound by default: click it in the menu to pick a key
+    world:SliderInt("dropesp_range", "Range (studs)", 1, 1000, 500)
+
     -- Settings: Performance Mode turns off the Hotbar fade and the notification slide
     local settings = tab:Section("Settings", "Left")
     settings:SliderFloat("ui_opacity", "UI Opacity", 0.3, 1.0, DEFAULT_OPACITY, "%.2f")
@@ -643,6 +680,9 @@ UI.AddTab("FuzzyHook - PRIVATE", function(tab)
     -- Right column: status, Inv Aim filters, then Debug Options at the bottom
     local status = tab:Section("Status", "Right")
     status:Text(reportLabel)
+
+    local wanted = tab:Section("Most Wanted", "Right")
+    wanted:Button("Print Most Wanted", onMostWantedClick)
 
     -- Inv Aim filters: one toggle per category (hides its items and everything inside them)
     local filters = tab:Section("Item Filter", "Right", {"Categories"}, 300)
@@ -959,7 +999,7 @@ end)
 -- PLAYER INFO PANEL (top-left by default)
 -- Shows the player closest to your screen center (within INFO_RADIUS):
 --   username, Reports, Playtime (TimePlayed seconds -> hours)
--- Data: ReplicatedStorage.Players.<name>.Status.Journey.WipeStatistics (TimePlayed)
+-- Data: ReplicatedStorage.Players.<name>.Status.Journey.Statistics (TimePlayed, falls back to WipeStatistics)
 --       ReplicatedStorage.Players.<name>.Status.UAC.Reports (attribute "1")
 -- Drawings are created once and reused; text is only written when it changes.
 ----------------------------------------------------------------------
@@ -1068,9 +1108,14 @@ local function readPlayerInfo(name)
     local n = folder and folder:FindFirstChild(name)
     local status = n and n:FindFirstChild("Status")
 
-    local ws = status and status:FindFirstChild("Journey")
-    ws = ws and ws:FindFirstChild("WipeStatistics")
-    local played = ws and ws:GetAttribute("TimePlayed")
+    -- TimePlayed (seconds): Journey.Statistics first, Journey.WipeStatistics as the fallback
+    local journey = status and status:FindFirstChild("Journey")
+    local st = journey and journey:FindFirstChild("Statistics")
+    local played = st and st:GetAttribute("TimePlayed")
+    if type(played) ~= "number" then
+        local ws = journey and journey:FindFirstChild("WipeStatistics")
+        played = ws and ws:GetAttribute("TimePlayed")
+    end
 
     local rep = status and status:FindFirstChild("UAC")
     rep = rep and rep:FindFirstChild("Reports")
@@ -2515,7 +2560,7 @@ end)
 local slOK
 do
     ----------------------------------------------------------------------
-    -- STAFF LIST PANEL (bottom-left by default)
+    -- STAFF LIST PANEL (under the Boss Tracker by default)
     -- Header "Scanning for staff", then only the usernames of players who have a
     -- Early Access flag (EarlyAccessUser on ReplicatedStorage.Players.<name>, with
     -- Status.Purchases.Passes.GivenEarlyAccess as the failsafe).
@@ -2531,12 +2576,12 @@ do
     --   * the player is listed as "<name> - God Mode" (orange) in this panel
     --   * their label becomes an orange "God Moded" (instead of [POSSIBLE MOD])
     --   * a red notification box appears when it turns on
-    -- The panel is bottom-anchored: it grows upward as names are added.
+    -- The panel is top-anchored (under the Boss Tracker): it grows downward as names are added.
     ----------------------------------------------------------------------
     local STAFF_LIST_INCLUDE_SELF = true -- TEST: lets you see yourself in the list; set to false later
     local SL_MAX_ROWS = 10
     local SL_ROW_H = 16
-    local SL_X, SL_W, SL_MARGIN = 20, 260, 20
+    local SL_W = 200 -- same width as the Boss Tracker so it lines up under it (and stays clear of Server Loot)
     local SL_MAX_TRIES = 20
 
     local staffSet = {}      -- [name] = true -> has a staff tag
@@ -2548,8 +2593,10 @@ do
     local staffDirty = true
     local staffWasOn = false
 
-    local slView = Workspace.CurrentCamera.ViewportSize
-    local slPanel = newPanel("staff", SL_X, slView.Y - SL_MARGIN, SL_W, 28, true)
+    -- Default spot: directly under the Boss Tracker (same left edge, 10px below its bottom).
+    -- The Boss Tracker is 36 + 6 rows * 16 + 6 = 138px tall and starts at y = 20, so this panel
+    -- starts at y = 168 and grows DOWNWARD as names are added.
+    local slPanel = newPanel("staff", math.floor(Workspace.CurrentCamera.ViewportSize.X - 200 - 20 - 10 - 200), 168, SL_W, 28)
     local slRows, slRowText, slRowGod = {}, {}, {}
     local slBg, slDot, slTitle, slSep, slCount
     local slCountText = ""
@@ -2615,7 +2662,7 @@ do
             slRows[i].Visible = (i <= n)
         end
 
-        placePanel(slPanel) -- bottom edge stays put, so the panel grows upward
+        placePanel(slPanel) -- top edge stays put, so the panel grows downward
     end
 
     local function renderStaffPanel()
