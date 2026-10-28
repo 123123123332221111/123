@@ -1,0 +1,3323 @@
+-- Matcha LuaVM: FuzzyHook - PRIVATE (draggable + transparent UI, equipment Hotbar)
+-- Notes:
+--  * UI.AddTab's callback runs every frame, so it only reads pre-built data
+--    (no closures / string building inside it).
+--  * Username and the Players folder are resolved once and cached.
+--  * A feature does no work while its toggle is off.
+--  * Every panel (Player Info, Inv Aim, Staff List, Hotbar, Server Loot) is draggable
+--    by its top bar. Panels and notification boxes use the "UI Opacity" slider.
+--  * No text has a stroke / outline.
+--  * Nothing prints to the console except one line at the very end, and only
+--    if everything loaded without a problem.
+--  * God Mode detection lives inside the Staff List block (it shares that block's
+--    scan loop, so it is controlled by the "Staff Alert" toggle).
+--  * Performance Mode (Settings section) turns off the Hotbar fade and the
+--    notification slide animations. The flag lives in Notification.perf.
+
+local Players, ReplicatedStorage, RunService, Workspace
+-- Username is resolved ONCE at launch and reused by every feature below.
+local LOCAL_NAME
+
+-- The services, your player and the camera may not exist yet if the script is
+-- executed while the game is still loading (that was the "attempt to index nil with
+-- 'LocalPlayer'" error). Retry for up to ~2 minutes before giving up.
+do
+    for _ = 1, 240 do
+        local ready = pcall(function()
+            Players = game:GetService("Players")
+            ReplicatedStorage = game:GetService("ReplicatedStorage")
+            RunService = game:GetService("RunService")
+            Workspace = game:GetService("Workspace")
+            LOCAL_NAME = Players.LocalPlayer.Name
+            assert(Workspace.CurrentCamera ~= nil, "camera not ready")
+        end)
+        if ready then break end
+        wait(0.5)
+    end
+
+    if not (Players and ReplicatedStorage and RunService and Workspace and LOCAL_NAME) then
+        warn("FuzzyHook - PRIVATE: the game did not finish loading, script stopped")
+        return
+    end
+end
+
+-- Counts errors caught while the script runs; the final "loaded" line needs this to be 0.
+local loadErrors = 0
+local function guarded(fn)
+    local ok = pcall(fn)
+    if not ok then loadErrors = loadErrors + 1 end
+end
+
+-- Staff detection (only Early Access counts, Elite and other passes are ignored):
+--   1) ReplicatedStorage.Players.<name>  -> Bool "EarlyAccessUser" (attribute, or a BoolValue child)
+--   2) failsafe: ReplicatedStorage.Players.<name>.Status.Purchases.Passes -> Bool "GivenEarlyAccess"
+--   3) failsafe: ReplicatedStorage.Players.<name>.Status.GameplayVariables -> Bool "GodMode"
+local STAFF_LABEL = "Early Access"
+
+local TICK_SECONDS = 0.5       -- main loop interval
+local LABEL_OFFSET = Vector3.new(0, 3.2, 0)
+local GOD_COLOR = Color3.fromRGB(255, 140, 0) -- orange: "God Moded" label + God Mode rows in the Staff List
+local INFO_RADIUS = 150        -- px from screen center a player must be within to count as "looked at"
+local INFO_SELECT_EVERY = 0.1  -- how often the looked-at player is re-picked (seconds)
+local INFO_REFRESH = 2         -- how often the looked-at player's stats are re-read (seconds)
+local INV_MAX_LINES = 26       -- max rows shown in the Inv Aim panel
+local INV_MAX_NODES = 150      -- safety cap on items read per inventory scan
+local INV_MAX_DEPTH = 4        -- how deep nested items are shown ({ } nesting)
+
+-- UI look / dragging
+local DEFAULT_OPACITY = 0.85   -- starting value of the "UI Opacity" slider (1 = solid)
+local DRAG_HEADER_H = 24       -- px: top strip of each panel that grabs the mouse
+local MOUSE_Y_OFFSET = 0       -- if panels jump ~36px when you grab them, set this to -36 (or 36)
+
+-- Hotbar panel
+-- (Lua allows only 200 local variables at once in this main chunk, so unused ones were removed)
+local HOTBAR_MODES = { "Looked at player", "Myself" }        -- "Hotbar Target" dropdown
+
+-- Hotbar team row ("View Player Teams")
+local TEAMS_REFRESH = 2      -- seconds between team re-reads for the targeted player
+local TEAMS_MAX_NODES = 300  -- safety cap on objects looked at inside one team folder
+local TEAMS_MAX_ROWS = 3     -- rows of member names under the team line
+local TEAMS_LINE_CHARS = 60  -- characters per row of member names before it wraps
+
+-- Server Loot panel
+local LOOT_REFRESH = 5          -- seconds between full server scans
+local LOOT_MAX_NODES = 2000     -- safety cap on inventory objects looked at per player
+local LOOT_MAX_ROWS = 50        -- max text rows in the panel (extra rows become "... +N more")
+local LOOT_INCLUDE_SELF = true  -- also list your own loot
+-- EXACT item names the scanner counts (order here = order shown under each player)
+local LOOT_ITEMS = {
+    "FlareGun", "Reapir", "SOCOM556", "PEQ15", "HSPV", "TitanShield", "Mag556Rnd100",
+    "TFZ98S", "CatToken", "ThermalModule", "R700", "338AP", "Gold50g",
+    "JPC", "IOTV4", "M4", "AsVal",
+}
+
+-- Inv Aim item list. Only items written here are ever shown; anything else in an
+-- inventory (e.g. a shirt that isn't listed) is ignored.
+-- Format: a "! category !" line starts a category, the lines under it are EXACT
+-- item names. The Filter toggles follow the order of this list. To add a category
+-- or item, just edit the text below.
+-- NOTE: everything inside a "Keychain" is always shown (see KEYCHAIN_NAME in the
+-- Inv Aim block), even if it is not written in this list.
+local ITEM_LIST_TEXT = [[
+! weapons !
+AKM
+AKMN
+AsVal
+M4
+RPG
+MK23
+Mosin
+Saiga12
+R700
+ADAR
+MP443
+SKS
+TFZ98S
+PPSH
+TT33
+TOZ106
+IZh81
+PKM
+PM
+Fal
+IZh12
+SVD
+Groza
+GM
+TFZ
+MP5
+VZ61
+TOZ87
+NagantRevolver
+IZH12
+IZH87
+MP5SD
+PPSH41
+RPG7
+
+! grenades !
+F1
+RGO
+RGD5
+M84
+F1Tripwire
+MON50
+PMN2
+
+! Meds !
+AI2
+AI4
+AA2
+IFAK
+Bandage
+Dressing
+Rags
+Defibrillator
+
+! Misc !
+DAGR
+Pathfinder
+Map
+Lighter
+Barricade
+Sandbags
+
+! Valuable !
+SPSh44
+Replica
+Gold50g
+GoldenTicket
+GoldSkull
+GoldWatch
+WhisperPlush
+DozerPlush
+EnzoPlush
+AntonPlush
+GPU
+RK2
+RK6
+LPVO
+ACOG
+9X39Z
+
+! Super Valuable !
+FlareGun
+Reapir
+SOCOM556
+PEQ15
+HSPV
+TitanShield
+Mag556Rnd100
+TFZ98S
+CatToken
+ThermalModule
+R700
+338AP
+
+! Stims !
+SerumYellow
+SerumGreen
+SerumRed
+SerumPurple
+
+! FOOD !
+Moloko
+Beans
+WaterBottle
+ChocolateBar
+ResKola
+KevCola
+CatfrogSoda
+BloxyCola
+Immunster
+ImmunsterReactor
+ImmunsterWinter
+Jerky
+MaxEnergy
+
+! Repair Kits !
+RepairKit
+Lvl4Plate
+
+! ARMOR !
+InflatedCrown
+ScavKingVest
+ScavKingHelmet
+Altyn
+MaskaVisor
+IOTV4
+JPC
+HSPV
+FastMT
+Pantsir3
+DozerArmor
+UNOVest
+UNOHelmet
+6B47
+6B27
+FastVisor
+Pokushanka
+TORS
+ZSh
+ZShVisor
+Kulon
+6B5
+6B2
+6B23
+6B45
+AltynVisor
+Dozer
+GMT
+IOLA
+MikeShades
+MotorcycleHelmet
+ScavKingCrown
+SSH68
+TWS
+TankerCap
+ConcealedVest
+Smersh
+Bandolier
+GP5
+GP7
+
+! BAGS !
+Attak5
+Lynx
+WastelandBackpack
+Tortilla
+SpecopsBackpack
+Wastelander
+
+! Keychain !
+Keychain
+
+! Keycards !
+OrangeCard
+RedCard
+BlueCard
+BlueKeycard
+OrangeKeycard
+RedKeycard
+]]
+
+-- Parsed once at load:
+--   CATEGORIES      = category names in list order (the toggles use this order)
+--   ITEM_CATEGORIES = [itemName] = { category, ... } (an item can be in several categories)
+local CATEGORIES = {}
+local ITEM_CATEGORIES = {}
+
+do
+    local function titleCase(s)
+        return (string.gsub(s, "(%a)([%w']*)", function(a, b)
+            return string.upper(a) .. string.lower(b)
+        end))
+    end
+
+    local current
+    for raw in string.gmatch(ITEM_LIST_TEXT, "[^\r\n]+") do
+        local line = string.match(raw, "^%s*(.-)%s*$")
+        if line ~= "" then
+            local header = string.match(line, "^!%s*(.-)%s*!$")
+            if header then
+                current = titleCase(header)
+                local seen = false
+                for i = 1, #CATEGORIES do
+                    if CATEGORIES[i] == current then seen = true break end
+                end
+                if not seen then CATEGORIES[#CATEGORIES + 1] = current end
+            elseif current then
+                local cats = ITEM_CATEGORIES[line]
+                if not cats then
+                    cats = {}
+                    ITEM_CATEGORIES[line] = cats
+                end
+                local has = false
+                for i = 1, #cats do
+                    if cats[i] == current then has = true break end
+                end
+                if not has then cats[#cats + 1] = current end
+            end
+        end
+    end
+end
+
+-- Highlighted items: shown in HIGHLIGHT_COLOR (deep pink) in the Server Loot panel and in
+-- Inv Aim (and as a pink-tinted tile in the Hotbar). Add or remove EXACT item names in
+-- the list; the set below is built once at load.
+local HIGHLIGHT_COLOR = Color3.fromRGB(255, 20, 147)
+local NORMAL_TEXT_COLOR = Color3.fromRGB(190, 190, 200)
+local HIGHLIGHT_LIST = {
+    "FlareGun", "Reapir", "SOCOM556", "PEQ15", "HSPV", "TitanShield", "Mag556Rnd100",
+    "TFZ98S", "CatToken", "ThermalModule", "R700", "338AP", "IOTV4",
+}
+local HIGHLIGHT = {} -- [itemName] = true
+for i = 1, #HIGHLIGHT_LIST do
+    HIGHLIGHT[HIGHLIGHT_LIST[i]] = true
+end
+
+----------------------------------------------------------------------
+-- UI OPACITY STATE
+-- One shared opacity value for every panel AND the notification boxes.
+--   * boxes use the "UI Opacity" slider value, text / dots use it + 0.1
+-- NOTE: Drawing.Transparency is assumed to be 1 = solid, 0 = invisible
+-- (Roblox convention). If the slider behaves backwards, change bgAlpha() and
+-- fgAlpha() below to return 1 - value.
+----------------------------------------------------------------------
+local uiOpacity = DEFAULT_OPACITY
+
+local function bgAlpha()
+    return uiOpacity
+end
+
+local function fgAlpha()
+    local v = uiOpacity + 0.1
+    return (v > 1) and 1 or v
+end
+
+----------------------------------------------------------------------
+-- NOTIFICATION BOX (reusable)
+-- Bottom-right box drawn with the Drawing API, stacks upward. Same look as the
+-- panels (rounded box, colored dot + title, separator, gray text) and it follows
+-- the UI Opacity slider. Not draggable.
+-- Use it for anything:
+--   Notification.push("Title", "Message")
+--   Notification.push("Title", "Message", { seconds = 15, color = Color3.fromRGB(255,160,0) })
+-- "color" is the color of the dot next to the title.
+-- Notification.perf = true (Performance Mode) skips the slide animations; the
+-- Hotbar fade reads the same flag.
+----------------------------------------------------------------------
+local Notification = {}
+do
+    -- Every notification is animated by ONE RenderStepped callback (below). When no
+    -- notification is on screen that callback returns immediately, so it costs nothing.
+    -- Life of a notification: slide in from the right (SLIDE_TIME) -> stays for
+    -- "seconds" with a countdown next to the title -> slides back out to the right.
+    -- Positions are only rewritten while it is sliding; while it rests, the only
+    -- work is updating the countdown text once per second.
+    local active = {}  -- [drawing] = true for box drawings, false for text / dots (used by refreshOpacity)
+    local slots = {}
+    local notes = {}   -- notifications currently on screen
+    local DEFAULT_COLOR = Color3.fromRGB(255, 80, 80)
+    local BG_COLOR = Color3.fromRGB(22, 22, 28)
+    local TITLE_COLOR = Color3.fromRGB(255, 255, 255)
+    local TEXT_COLOR = Color3.fromRGB(190, 190, 200)
+    local LINE_COLOR = Color3.fromRGB(80, 80, 92)
+    local W, H = 260, 58
+    local SLIDE_TIME = 0.35     -- seconds for the slide in / slide out
+    local OFFSCREEN = W + 40    -- how far right of its resting spot it starts / ends
+
+    -- Re-applies the UI Opacity slider to every notification that is on screen
+    function Notification.refreshOpacity()
+        local bgA, fgA = bgAlpha(), fgAlpha()
+        for d, isBg in pairs(active) do
+            pcall(function() d.Transparency = isBg and bgA or fgA end)
+        end
+    end
+
+    -- Moves every drawing of a notification to its resting spot + offset (px to the right)
+    local function setOffset(n, offset)
+        local x = n.baseX + offset
+        local y = n.y
+        local items = n.items
+        for i = 1, #items do
+            local it = items[i]
+            it.d.Position = Vector2.new(x + it.ox, y + it.oy)
+        end
+    end
+
+    local function destroyNote(n)
+        local items = n.items
+        for i = 1, #items do
+            local d = items[i].d
+            active[d] = nil
+            pcall(function() d:Remove() end)
+        end
+        slots[n.slot] = nil
+    end
+
+    -- Title text is "<title> (<seconds left>)"; only written when the number changes
+    local function setTimer(n, secs)
+        if n.timer ~= secs then
+            n.timer = secs
+            n.titleD.Text = n.title .. " (" .. secs .. ")"
+        end
+    end
+
+    local function make(n, class, props, ox, oy, isBg)
+        local d = Drawing.new(class)
+        n.items[#n.items + 1] = { d = d, ox = ox, oy = oy }
+        for k, v in pairs(props) do
+            d[k] = v
+        end
+        if class == "Text" then d.Outline = false end -- no stroke on text
+        d.Transparency = isBg and bgAlpha() or fgAlpha()
+        active[d] = isBg or false
+        d.Position = Vector2.new(n.baseX + OFFSCREEN + ox, n.y + oy) -- starts off screen
+        return d
+    end
+
+    function Notification.push(title, message, opts)
+        opts = opts or {}
+        local seconds = opts.seconds or 10
+        local accent = opts.color or DEFAULT_COLOR
+        local secs = math.ceil(seconds)
+
+        local slot = 1
+        while slots[slot] do slot = slot + 1 end
+        slots[slot] = true
+
+        local n = { slot = slot, title = title, seconds = seconds, items = {}, timer = secs, settled = false }
+
+        local built = pcall(function()
+            local view = Workspace.CurrentCamera.ViewportSize
+            n.baseX = view.X - W - 20
+            n.y = view.Y - (H + 10) * slot - 10
+
+            local bg = make(n, "Square", {
+                Filled = true, Color = BG_COLOR,
+                Size = Vector2.new(W, H), ZIndex = 10, Visible = true,
+            }, 0, 0, true)
+            pcall(function() bg.Corner = 8 end) -- rounded corners if supported
+
+            make(n, "Square", { -- colored dot next to the title
+                Filled = true, Color = accent,
+                Size = Vector2.new(6, 6), ZIndex = 11, Visible = true,
+            }, 12, 12, false)
+            n.titleD = make(n, "Text", {
+                Text = title .. " (" .. secs .. ")", Color = TITLE_COLOR,
+                Font = Drawing.Fonts.SystemBold, Size = 12,
+                ZIndex = 11, Visible = true,
+            }, 24, 8, false)
+            make(n, "Square", { -- separator line
+                Filled = true, Color = LINE_COLOR,
+                Size = Vector2.new(W - 24, 1), ZIndex = 11, Visible = true,
+            }, 12, 27, false)
+            make(n, "Text", {
+                Text = message, Color = TEXT_COLOR,
+                Font = Drawing.Fonts.System, Size = 13,
+                ZIndex = 11, Visible = true,
+            }, 12, 35, false)
+        end)
+
+        if built then
+            -- Performance Mode: start already "settled" so there is no slide-in
+            n.t0 = tick() - (Notification.perf and SLIDE_TIME or 0)
+            notes[#notes + 1] = n
+        else
+            loadErrors = loadErrors + 1
+            destroyNote(n) -- removes anything half-built and frees the slot
+            -- the box could not be drawn: fall back to Matcha's own notification
+            pcall(function() notify(message, title, seconds) end)
+        end
+    end
+
+    local function noteStep()
+        if #notes == 0 then return end -- nothing on screen: no work at all
+        local now = tick()
+        local perf = Notification.perf == true -- Performance Mode: no slide animations
+        local i = 1
+        while i <= #notes do
+            local n = notes[i]
+            local age = now - n.t0
+            local holdEnd = SLIDE_TIME + n.seconds
+
+            if age < SLIDE_TIME and not perf then
+                -- slide in (ease-out: fast at first, settles gently)
+                local inv = 1 - age / SLIDE_TIME
+                setOffset(n, OFFSCREEN * inv * inv * inv)
+                i = i + 1
+            elseif age < holdEnd then
+                -- resting: snap into place once, then only the countdown text changes
+                if not n.settled then
+                    n.settled = true
+                    setOffset(n, 0)
+                end
+                setTimer(n, math.ceil(holdEnd - age))
+                i = i + 1
+            elseif age < holdEnd + SLIDE_TIME and not perf then
+                -- slide out to the right (ease-in: starts gently, speeds up)
+                local t = (age - holdEnd) / SLIDE_TIME
+                setOffset(n, OFFSCREEN * t * t * t)
+                setTimer(n, 0)
+                i = i + 1
+            else
+                destroyNote(n)
+                table.remove(notes, i)
+            end
+        end
+    end
+
+    RunService.RenderStepped:Connect(function()
+        guarded(noteStep)
+    end)
+end
+
+local STAFF_NOTIFY = { seconds = 30, color = Color3.fromRGB(255, 80, 80) }
+local REPORT_NOTIFY = { seconds = 10, color = Color3.fromRGB(255, 170, 0) }
+
+----------------------------------------------------------------------
+-- Shared UI state (strings are only rebuilt when the value changes)
+----------------------------------------------------------------------
+local reportText, reportLabel = "N/A", "Report Count: N/A"
+-- [playerName] = true  -> red "[POSSIBLE MOD]" label (Early Access tag)
+-- [playerName] = "god" -> orange "God Moded" label (GodMode on; wins over the tag)
+-- (fed by the Staff List block)
+local modTargets = {}
+
+local function setReportText(text)
+    if text ~= reportText then
+        reportText = text
+        reportLabel = "Report Count: " .. text
+    end
+end
+
+----------------------------------------------------------------------
+-- UI (all callbacks / ids / labels are built once, not per frame)
+----------------------------------------------------------------------
+-- Toggles have no console output for now; this returns no callback.
+-- Kept as a function so a callback can be added per toggle later.
+local function printToggle(name)
+    return nil
+end
+
+-- Toggle groups shown in the menu (ids never change, so saved values keep working)
+local IMPORTANT_TOGGLES = {
+    { id = "opt_two",       label = "Report Alert", default = false, cb = printToggle("Report Alert") },
+    { id = "opt_stafflist", label = "Staff Alert",  default = true,  cb = printToggle("Staff Alert") },
+    { id = "opt_info",      label = "Player Info",  default = true,  cb = printToggle("Player Info") },
+    { id = "opt_teams",     label = "View Player Teams", default = true, cb = printToggle("View Player Teams") },
+}
+
+local SERVER_TOGGLES = {
+    { id = "opt_four", label = "Server Loot Scanner", default = true, cb = printToggle("Server Loot Scanner") },
+    { id = "opt_boss", label = "Boss Tracker",        default = true, cb = printToggle("Boss Tracker") },
+}
+
+local INVENTORY_TOGGLES = {
+    { id = "opt_three",  label = "Inventory Scanner", default = true, cb = printToggle("Inventory Scanner") },
+    { id = "opt_inv",    label = "Inv Aim",           default = true, cb = printToggle("Inv Aim") },
+    { id = "opt_hotbar", label = "Hotbar",            default = true, cb = printToggle("Hotbar") },
+    { id = "opt_attico", label = "Attachment Icons",  default = true, cb = printToggle("Attachment Icons") },
+}
+
+-- One "Filter <category>" toggle per category (built once)
+-- (the ids still start with "hide_cat_" so saved values keep working)
+local CATEGORY_TOGGLES = {}
+for _, cat in ipairs(CATEGORIES) do
+    local idSuffix = string.gsub(cat, " ", "_")
+    CATEGORY_TOGGLES[#CATEGORY_TOGGLES + 1] = {
+        cat = cat,
+        id = "hide_cat_" .. idSuffix,
+        label = "Filter " .. cat,
+        cb = printToggle("Filter " .. cat),
+    }
+end
+
+-- Assigned further down (needs the panels to exist); the button callback is built once here.
+local resetPanels
+local function onResetClick()
+    if resetPanels then resetPanels() end
+end
+
+-- Assigned inside the Hotbar block; prints what the hotbar sees (debug button).
+local iconTest
+local function onIconTestClick()
+    if iconTest then iconTest() end
+end
+
+-- "Test Notification" button: pushes a box so you can check notifications work.
+-- Click it several times to also check that boxes stack upward.
+local TEST_NOTIFY = { seconds = 6, color = Color3.fromRGB(130, 110, 255) }
+local testNotifyCount = 0
+local function onTestNotifyClick()
+    testNotifyCount = testNotifyCount + 1
+    Notification.push("Test Notification", "Notifications are working (#" .. testNotifyCount .. ")", TEST_NOTIFY)
+end
+
+-- Draws one section of toggles (the tab callback runs every frame, so no allocations here)
+local function addToggleSection(tab, title, side, list)
+    local sec = tab:Section(title, side)
+    for i = 1, #list do
+        local t = list[i]
+        sec:Toggle(t.id, t.label, t.default, t.cb)
+    end
+end
+
+-- Title of the bottom-right section (built once, not per frame).
+-- If the menu font cannot draw the emoji and shows boxes / "?", swap them for "/!\" here.
+local DEBUG_TITLE = "\u{26A0}\u{FE0F} Debug Options \u{26A0}\u{FE0F}"
+
+UI.AddTab("FuzzyHook - PRIVATE", function(tab)
+    -- Left column: toggles
+    addToggleSection(tab, "Important Toggles", "Left", IMPORTANT_TOGGLES)
+    addToggleSection(tab, "Server Toggles", "Left", SERVER_TOGGLES)
+    addToggleSection(tab, "Inventory Toggles", "Left", INVENTORY_TOGGLES)
+
+    -- Settings: Performance Mode turns off the Hotbar fade and the notification slide
+    local settings = tab:Section("Settings", "Left")
+    settings:SliderFloat("ui_opacity", "UI Opacity", 0.3, 1.0, DEFAULT_OPACITY, "%.2f")
+    settings:Toggle("opt_perf", "Performance Mode", false)
+    settings:Tip("Disables the Hotbar fade and notification slide animations")
+
+    -- Right column: status, Inv Aim filters, then Debug Options at the bottom
+    local status = tab:Section("Status", "Right")
+    status:Text(reportLabel)
+
+    -- Inv Aim filters: one toggle per category (hides its items and everything inside them)
+    local filters = tab:Section("Item Filter", "Right", {"Categories"}, 300)
+    filters:Text("Item Filter") -- the tabbed section does not draw its own name, so the title is a text line
+    filters:Spacing()
+    for _, t in ipairs(CATEGORY_TOGGLES) do
+        filters:Toggle(t.id, t.label, false, t.cb)
+    end
+
+    -- Debug Options (same widgets / ids as the old "Interface" section, so saved values keep working)
+    local iface = tab:Section(DEBUG_TITLE, "Right")
+    iface:Combo("hotbar_target", "Hotbar Target", HOTBAR_MODES, 0)
+    iface:Button("Reset UI Positions", onResetClick)
+    iface:Button("Test Notification", onTestNotifyClick)
+    iface:Button("Hotbar Debug (prints)", onIconTestClick)
+    iface:Toggle("inv_showall", "Inv Aim: Show All (debug)", false)
+    iface:Text("Drag a panel by its top bar")
+end)
+
+----------------------------------------------------------------------
+-- Cached lookups
+----------------------------------------------------------------------
+local playersFolder -- ReplicatedStorage.Players, cached after first find
+
+local function getPlayersFolder()
+    if not playersFolder or playersFolder.Parent == nil then
+        playersFolder = ReplicatedStorage:FindFirstChild("Players")
+    end
+    return playersFolder
+end
+
+-- ReplicatedStorage.Players.<name>.Status.Purchases.Passes (no temp tables)
+local function getPasses(folder, name)
+    local n = folder:FindFirstChild(name)
+    n = n and n:FindFirstChild("Status")
+    n = n and n:FindFirstChild("Purchases")
+    return n and n:FindFirstChild("Passes")
+end
+
+-- Reports: ReplicatedStorage.Players.<you>.Status.UAC.Reports (count is attribute "1")
+-- Looked up fresh on every read so the attribute value is never stale
+-- (4 cheap lookups every 0.5s).
+local function readReports()
+    local folder = getPlayersFolder()
+    local n = folder and folder:FindFirstChild(LOCAL_NAME)
+    n = n and n:FindFirstChild("Status")
+    n = n and n:FindFirstChild("UAC")
+    n = n and n:FindFirstChild("Reports")
+    if not n then return nil end
+
+    local attr = n:GetAttribute("1")
+    if type(attr) == "number" then return attr end
+    return n.Value
+end
+
+local function isOn(v)
+    return v == true or v == 1
+end
+
+-- A Bool can be stored as an attribute or as a BoolValue child; check both.
+local function readFlag(inst, name)
+    if isOn(inst:GetAttribute(name)) then return true end
+    local child = inst:FindFirstChild(name)
+    if child and isOn(child.Value) then return true end
+    return false
+end
+
+-- plrFolder = ReplicatedStorage.Players.<name>, passes = its Status.Purchases.Passes (may be nil)
+local function isEarlyAccess(plrFolder, passes)
+    if readFlag(plrFolder, "EarlyAccessUser") then return true end
+    if passes and readFlag(passes, "GivenEarlyAccess") then return true end -- failsafe
+    return false
+end
+
+----------------------------------------------------------------------
+-- PANEL SYSTEM (shared by Player Info, Inv Aim, Hotbar, Staff List)
+-- Every drawing in a panel is registered with an offset from the panel's
+-- origin, so moving a panel = rewriting each drawing's Position once.
+--   * bg drawings use the UI Opacity value, text uses it + 0.1
+--   * panel.bottom = true means panel.y is the BOTTOM edge (panel grows upward)
+--   * panel.fade (optional, 0..1) multiplies every drawing's opacity; only the
+--     Hotbar sets it (fade in / out)
+-- NOTE: Drawing.Transparency is assumed to be 1 = solid, 0 = invisible
+-- (Roblox convention). If the slider behaves backwards, change bgAlpha() and
+-- fgAlpha() above to return 1 - value.
+----------------------------------------------------------------------
+local panels = {}
+
+local function newPanel(id, x, y, w, h, bottom)
+    local p = {
+        id = id,
+        x = x, y = y,       -- current position (top-left, or bottom-left if p.bottom)
+        dx = x, dy = y,     -- default position (for "Reset UI Positions")
+        w = w, h = h,
+        bottom = bottom or false,
+        items = {},         -- { d = Drawing, ox = number, oy = number, bg = bool }
+        shown = false,
+    }
+    panels[#panels + 1] = p
+    return p
+end
+
+local function panelTop(p)
+    if p.bottom then return p.y - p.h end
+    return p.y
+end
+
+-- Writes every drawing's Position from the panel origin (only called on move / re-layout)
+local function placePanel(p)
+    local top = panelTop(p)
+    local items = p.items
+    for i = 1, #items do
+        local it = items[i]
+        it.d.Position = Vector2.new(p.x + it.ox, top + it.oy)
+    end
+end
+
+-- Creates a drawing inside a panel. props must NOT contain Position (use ox / oy).
+local function addItem(p, class, props, ox, oy, isBg)
+    local d = Drawing.new(class)
+    p.items[#p.items + 1] = { d = d, ox = ox, oy = oy, bg = isBg or false }
+    for k, v in pairs(props) do
+        d[k] = v
+    end
+    if class == "Text" then d.Outline = false end -- no stroke on text
+    d.Transparency = isBg and bgAlpha() or fgAlpha()
+    d.Position = Vector2.new(p.x + ox, panelTop(p) + oy)
+    return d
+end
+
+local function destroyPanel(p)
+    for i = 1, #p.items do
+        local d = p.items[i].d
+        pcall(function() d:Remove() end)
+    end
+    p.items = {}
+    p.shown = false
+end
+
+local function setPanelItemsVisible(p, v)
+    local items = p.items
+    for i = 1, #items do
+        items[i].d.Visible = v
+    end
+    p.shown = v
+end
+
+local function applyOpacity()
+    Notification.refreshOpacity()
+    local bgA, fgA = bgAlpha(), fgAlpha()
+    for i = 1, #panels do
+        local p = panels[i]
+        local f = p.fade or 1 -- only the hotbar sets this (fade multiplier)
+        local items = p.items
+        for j = 1, #items do
+            local it = items[j]
+            it.d.Transparency = (it.bg and bgA or fgA) * f
+        end
+    end
+end
+
+local function clamp(v, lo, hi)
+    if hi < lo then return lo end
+    if v < lo then return lo end
+    if v > hi then return hi end
+    return v
+end
+
+resetPanels = function()
+    for i = 1, #panels do
+        local p = panels[i]
+        p.x, p.y = p.dx, p.dy
+        if p.id == "hotbar" then
+            p.x = math.floor((Workspace.CurrentCamera.ViewportSize.X - p.w) / 2)
+        end
+        placePanel(p)
+    end
+end
+
+----------------------------------------------------------------------
+-- Report loop (Report Count label always, Report Alert while its toggle is on)
+----------------------------------------------------------------------
+local lastReports -- nil while Report Alert is off; baseline count while on
+
+task.spawn(function()
+    while true do
+        -- Report Count label (always) + Report Alert (toggle)
+        local ok, count = pcall(readReports)
+        if not ok then loadErrors = loadErrors + 1 end
+
+        if ok and type(count) == "number" then
+            setReportText(tostring(count))
+
+            if UI.GetValue("opt_two") then
+                if lastReports == nil then
+                    lastReports = count -- baseline when the toggle is switched on
+                elseif count > lastReports then
+                    local diff = count - lastReports
+                    lastReports = count
+                    Notification.push(
+                        "Report Alert",
+                        "You were reported! Total: " .. count .. " (+" .. diff .. ")",
+                        REPORT_NOTIFY
+                    )
+                elseif count < lastReports then
+                    lastReports = count -- count was reset/lowered
+                end
+            else
+                lastReports = nil
+            end
+        else
+            setReportText("N/A")
+        end
+
+        wait(TICK_SECONDS)
+    end
+end)
+
+----------------------------------------------------------------------
+-- [POSSIBLE MOD] / "God Moded" labels drawn over detected players
+-- (world overlay, not a panel: left opaque and not draggable)
+-- modTargets[name] == true  -> red "[POSSIBLE MOD]"
+-- modTargets[name] == "god" -> orange "God Moded"
+----------------------------------------------------------------------
+local modLabels = {}        -- [playerName] = { d = Drawing, plr = Player, part = BasePart, vis = bool, mode = true | "god" }
+local labelsBroken = false  -- stop retrying if Drawing rejects a property
+
+local function makeModLabel()
+    local d = Drawing.new("Text")
+    local ok = pcall(function()
+        d.Text = "[POSSIBLE MOD]"
+        d.Color = Color3.fromRGB(255, 0, 0)
+        d.Font = Drawing.Fonts.SystemBold
+        d.Size = 12
+        d.Center = true
+        d.Outline = false
+        d.Visible = false
+    end)
+    if not ok then
+        pcall(function() d:Remove() end)
+        return nil
+    end
+    return d
+end
+
+-- RenderStepped = once per rendered frame (smoother for overlays than Heartbeat)
+RunService.RenderStepped:Connect(function()
+    if labelsBroken then return end
+    -- nothing detected and nothing drawn -> no work at all
+    if next(modTargets) == nil and next(modLabels) == nil then return end
+
+    -- remove labels for players who are no longer detected / left
+    for name, e in pairs(modLabels) do
+        if not modTargets[name] then
+            pcall(function() e.d:Remove() end)
+            modLabels[name] = nil
+        end
+    end
+
+    for name, mode in pairs(modTargets) do
+        local e = modLabels[name]
+        if not e then
+            local d = makeModLabel()
+            if not d then
+                labelsBroken = true
+                return
+            end
+            e = { d = d, vis = false }
+            modLabels[name] = e
+        end
+
+        -- cached part; only re-resolved when it disappears (respawn / leave)
+        local part = e.part
+        if not part or part.Parent == nil then
+            local plr = e.plr
+            if not plr or plr.Parent == nil then
+                plr = Players:FindFirstChild(name)
+                e.plr = plr
+            end
+            local char = plr and plr.Character
+            part = char and (char:FindFirstChild("HumanoidRootPart") or char:FindFirstChild("Head"))
+            e.part = part
+        end
+
+        local d = e.d
+
+        -- text / color follow the detection type; only written when it changes
+        if e.mode ~= mode then
+            e.mode = mode
+            if mode == "god" then
+                d.Text = "God Moded"
+                d.Color = GOD_COLOR
+            else
+                d.Text = "[POSSIBLE MOD]"
+                d.Color = Color3.fromRGB(255, 0, 0)
+            end
+        end
+
+        if part then
+            local pos, onScreen = WorldToScreen(part.Position + LABEL_OFFSET)
+            if onScreen then
+                d.Position = Vector2.new(pos.X, pos.Y - 7)
+                if not e.vis then d.Visible = true; e.vis = true end
+            elseif e.vis then
+                d.Visible = false; e.vis = false
+            end
+        elseif e.vis then
+            d.Visible = false; e.vis = false
+        end
+    end
+end)
+
+----------------------------------------------------------------------
+-- PLAYER INFO PANEL (top-left by default)
+-- Shows the player closest to your screen center (within INFO_RADIUS):
+--   username, Reports, Playtime (TimePlayed seconds -> hours)
+-- Data: ReplicatedStorage.Players.<name>.Status.Journey.WipeStatistics (TimePlayed)
+--       ReplicatedStorage.Players.<name>.Status.UAC.Reports (attribute "1")
+-- Drawings are created once and reused; text is only written when it changes.
+----------------------------------------------------------------------
+local infoPanel = newPanel("info", 20, 20, 210, 114)
+local infoVisible = false
+local infoCache = { name = "", reports = "", play = "" }
+local infoName, infoReports, infoPlay
+
+local panelOK = pcall(function()
+    local W, H = 210, 114
+    local GRAY = Color3.fromRGB(190, 190, 200)
+
+    local bg = addItem(infoPanel, "Square", {
+        Filled = true, Color = Color3.fromRGB(22, 22, 28),
+        Size = Vector2.new(W, H), ZIndex = 1, Visible = false,
+    }, 0, 0, true)
+    pcall(function() bg.Corner = 8 end) -- rounded corners if supported
+
+    addItem(infoPanel, "Square", { -- purple dot next to the title
+        Filled = true, Color = Color3.fromRGB(130, 110, 255),
+        Size = Vector2.new(6, 6), ZIndex = 2, Visible = false,
+    }, 12, 12)
+    addItem(infoPanel, "Text", {
+        Text = "Player Info", Color = GRAY,
+        Font = Drawing.Fonts.System, Size = 12,
+        ZIndex = 2, Visible = false,
+    }, 24, 8)
+    infoName = addItem(infoPanel, "Text", {
+        Text = "", Color = Color3.fromRGB(255, 255, 255),
+        Font = Drawing.Fonts.SystemBold, Size = 14,
+        ZIndex = 2, Visible = false,
+    }, 12, 30)
+    addItem(infoPanel, "Square", { -- separator line
+        Filled = true, Color = Color3.fromRGB(80, 80, 92),
+        Size = Vector2.new(W - 24, 1), ZIndex = 2, Visible = false,
+    }, 12, 52)
+    infoReports = addItem(infoPanel, "Text", {
+        Text = "", Color = GRAY,
+        Font = Drawing.Fonts.System, Size = 13,
+        ZIndex = 2, Visible = false,
+    }, 12, 62)
+    infoPlay = addItem(infoPanel, "Text", {
+        Text = "", Color = GRAY,
+        Font = Drawing.Fonts.System, Size = 13,
+        ZIndex = 2, Visible = false,
+    }, 12, 84)
+end)
+
+if not panelOK then
+    destroyPanel(infoPanel)
+end
+
+local function showInfoPanel(visible)
+    if visible ~= infoVisible then
+        setPanelItemsVisible(infoPanel, visible)
+        infoVisible = visible
+    end
+end
+
+local function updateInfoPanel(name, reports, play)
+    if infoCache.name ~= name then
+        infoCache.name = name
+        infoName.Text = name
+    end
+    if infoCache.reports ~= reports then
+        infoCache.reports = reports
+        infoReports.Text = reports
+    end
+    if infoCache.play ~= play then
+        infoCache.play = play
+        infoPlay.Text = play
+    end
+end
+
+-- Closest player to the screen center within INFO_RADIUS (squared compare, no sqrt)
+local function findLookedAtPlayer()
+    local view = Workspace.CurrentCamera.ViewportSize
+    local cx, cy = view.X * 0.5, view.Y * 0.5
+    local bestSq = INFO_RADIUS * INFO_RADIUS
+    local best
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        local name = plr.Name
+        if name ~= LOCAL_NAME then
+            local char = plr.Character
+            local hrp = char and char:FindFirstChild("HumanoidRootPart")
+            if hrp then
+                local pos, onScreen = WorldToScreen(hrp.Position)
+                if onScreen then
+                    local dx, dy = pos.X - cx, pos.Y - cy
+                    local sq = dx * dx + dy * dy
+                    if sq < bestSq then
+                        bestSq = sq
+                        best = name
+                    end
+                end
+            end
+        end
+    end
+    return best
+end
+
+-- Returns formatted Reports and Playtime strings ("?" when unavailable)
+local function readPlayerInfo(name)
+    local folder = getPlayersFolder()
+    local n = folder and folder:FindFirstChild(name)
+    local status = n and n:FindFirstChild("Status")
+
+    local ws = status and status:FindFirstChild("Journey")
+    ws = ws and ws:FindFirstChild("WipeStatistics")
+    local played = ws and ws:GetAttribute("TimePlayed")
+
+    local rep = status and status:FindFirstChild("UAC")
+    rep = rep and rep:FindFirstChild("Reports")
+    local reports = rep and rep:GetAttribute("1")
+
+    local reportsStr = "Reports: " .. (type(reports) == "number" and tostring(reports) or "?")
+    local playStr = "Playtime: " .. (type(played) == "number" and string.format("%.1fh", played / 3600) or "?")
+    return reportsStr, playStr
+end
+
+-- (own scope: Inv Aim panel; shares invOK, showInvPanel, updateInvPanel)
+local invOK, showInvPanel, updateInvPanel
+do
+    ----------------------------------------------------------------------
+    -- INV AIM PANEL (below Player Info by default)
+    -- Shows everything inside ReplicatedStorage.Players.<name>.Inventory for the
+    -- player you are looking at. Nothing is hardcoded: every item is read by
+    -- whatever name it has, items that contain other items are shown as
+    --   Name {
+    --       inner item
+    --   }
+    -- and Folder objects are treated as plain containers (their contents are
+    -- shown, the folder itself is not). Only items in ITEM_LIST_TEXT (top of the
+    -- file) are shown, and each category in that list has a "Filter" toggle.
+    -- KEYCHAIN: everything inside a Keychain is shown (even items that are not in
+    -- the list). "Filter Keychain" hides the Keychain and everything inside it.
+    ----------------------------------------------------------------------
+    local INDENTS = { [0] = "", "   ", "      ", "         ", "            " }
+    local INV_X, INV_Y, INV_W = 20, 148, 210
+    local INV_ROW_H = 16
+    -- Any item whose name contains "keychain" (any capitalisation, e.g. KeyChain, Keychain1)
+    local function isKeychainName(name)
+        return string.find(string.lower(name), "keychain", 1, true) ~= nil
+    end
+
+    local invPanel = newPanel("inv", INV_X, INV_Y, INV_W, 70)
+    local invStatic = {}        -- the 5 static drawings (box, dot, title, name, separator)
+    local invLines = {}         -- pooled text rows
+    local invCache = { name = "", lines = {} }
+    local invLineCount = 0
+    local invVisible = false
+    local invBg, invName
+    local invHidden = {}        -- [categoryName] = true while its "Filter" toggle is on
+
+    invOK = pcall(function()
+        local GRAY = Color3.fromRGB(190, 190, 200)
+
+        invBg = addItem(invPanel, "Square", {
+            Filled = true, Color = Color3.fromRGB(22, 22, 28),
+            Size = Vector2.new(INV_W, 70), ZIndex = 1, Visible = false,
+        }, 0, 0, true)
+        pcall(function() invBg.Corner = 8 end)
+        invStatic[1] = invBg
+
+        invStatic[2] = addItem(invPanel, "Square", {
+            Filled = true, Color = Color3.fromRGB(130, 110, 255),
+            Size = Vector2.new(6, 6), ZIndex = 2, Visible = false,
+        }, 12, 12)
+        invStatic[3] = addItem(invPanel, "Text", {
+            Text = "Inv Aim", Color = Color3.fromRGB(255, 255, 255),
+            Font = Drawing.Fonts.SystemBold, Size = 12,
+            ZIndex = 2, Visible = false,
+        }, 24, 8)
+        invName = addItem(invPanel, "Text", {
+            Text = "", Color = GRAY,
+            Font = Drawing.Fonts.SystemBold, Size = 13,
+            ZIndex = 2, Visible = false,
+        }, 12, 30)
+        invStatic[4] = invName
+        invStatic[5] = addItem(invPanel, "Square", {
+            Filled = true, Color = Color3.fromRGB(80, 80, 92),
+            Size = Vector2.new(INV_W - 24, 1), ZIndex = 2, Visible = false,
+        }, 12, 52)
+
+        for i = 1, INV_MAX_LINES do
+            invLines[i] = addItem(invPanel, "Text", {
+                Text = "", Color = GRAY,
+                Font = Drawing.Fonts.System, Size = 13,
+                ZIndex = 2, Visible = false,
+            }, 12, 62 + (i - 1) * INV_ROW_H)
+        end
+    end)
+
+    if not invOK then
+        destroyPanel(invPanel)
+        invStatic, invLines = {}, {}
+    end
+
+    local INV_STATIC_COUNT = 5
+
+    function showInvPanel(visible)
+        if visible == invVisible then return end
+        for i = 1, INV_STATIC_COUNT do
+            invStatic[i].Visible = visible
+        end
+        for i = 1, invLineCount do
+            invLines[i].Visible = visible
+        end
+        invVisible = visible
+        invPanel.shown = visible
+    end
+
+    local function setInvLineCount(n)
+        if n == invLineCount then return end
+        if invVisible then
+            for i = n + 1, invLineCount do invLines[i].Visible = false end
+            for i = invLineCount + 1, n do invLines[i].Visible = true end
+        end
+        invLineCount = n
+        invPanel.h = 70 + n * INV_ROW_H
+        invBg.Size = Vector2.new(INV_W, invPanel.h)
+    end
+
+    -- An item is shown if it is in the list AND at least one of its categories
+    -- is not filtered (so an item listed twice, e.g. R700, stays visible while any
+    -- of its categories is still on).
+    local function isItemShown(name)
+        local cats = ITEM_CATEGORIES[name]
+        if not cats then return false end
+        for i = 1, #cats do
+            if not invHidden[cats[i]] then return true end
+        end
+        return false
+    end
+
+    -- Reads a list of inventory children into display rows.
+    --  * items not in the list (or in a filtered category) get no row of their own,
+    --    but anything listed inside them is still shown (at the same indent)
+    --  * items that contain shown items are written as  Name { ... }
+    --  * force = true while inside a Keychain: every item is shown, listed or not
+    --  * a filtered Keychain (and everything in it) is skipped completely
+    local function collectInventory(children, depth, out, state, force)
+        for i = 1, #children do
+            if state.count >= INV_MAX_NODES then
+                state.truncated = true
+                return
+            end
+            local c = children[i]
+            local name = c.Name
+
+            if c.ClassName == "Folder" then
+                collectInventory(c:GetChildren(), depth, out, state, force) -- container only
+            else
+                state.count = state.count + 1
+
+                local isKeychain = isKeychainName(name)
+                -- "Filter Keychain" on: the keychain and everything inside it is skipped
+                local filteredKeychain = isKeychain and not force and invHidden["Keychain"] == true
+
+                if not filteredKeychain then
+                    local kids = c:GetChildren()
+                    -- state.all = debug toggle: show every item, listed or not
+                    local shown = force or state.all or isKeychain or isItemShown(name)
+                    local childForce = force or isKeychain -- everything inside a keychain is shown
+
+                    if shown then
+                        if #kids > 0 and depth < INV_MAX_DEPTH then
+                            local start = #out + 1
+                            out[start] = INDENTS[depth] .. name .. " {"
+                            collectInventory(kids, depth + 1, out, state, childForce)
+                            if #out == start then
+                                out[start] = INDENTS[depth] .. name -- nothing shown inside: no braces
+                            else
+                                out[#out + 1] = INDENTS[depth] .. "}"
+                            end
+                        else
+                            out[#out + 1] = INDENTS[depth] .. name
+                        end
+                    elseif #kids > 0 then
+                        collectInventory(kids, depth, out, state, childForce) -- not shown, but look inside it
+                    end
+                end
+            end
+        end
+    end
+
+    function updateInvPanel(name)
+        local folder = getPlayersFolder()
+        local plr = folder and folder:FindFirstChild(name)
+        local inv = plr and plr:FindFirstChild("Inventory")
+
+        local out = {}
+        if not inv then
+            out[1] = "No inventory found"
+        else
+            for i = 1, #CATEGORY_TOGGLES do
+                local t = CATEGORY_TOGGLES[i]
+                invHidden[t.cat] = UI.GetValue(t.id) == true
+            end
+
+            local state = { count = 0, truncated = false, all = UI.GetValue("inv_showall") == true }
+            collectInventory(inv:GetChildren(), 0, out, state)
+            if state.truncated then out[#out + 1] = "..." end
+            if #out == 0 then out[1] = "(nothing to show)" end
+        end
+
+        -- keep within the pooled rows
+        if #out > INV_MAX_LINES then
+            local extra = #out - (INV_MAX_LINES - 1)
+            for i = #out, INV_MAX_LINES, -1 do out[i] = nil end
+            out[INV_MAX_LINES] = "... +" .. extra .. " more"
+        end
+
+        -- only write text that actually changed
+        if invCache.name ~= name then
+            invCache.name = name
+            invName.Text = name
+        end
+        local lines = invCache.lines
+        local hls = invCache.hl
+        if not hls then
+            hls = {}
+            invCache.hl = hls
+        end
+        for i = 1, #out do
+            if lines[i] ~= out[i] then
+                lines[i] = out[i]
+                invLines[i].Text = out[i]
+            end
+            -- highlighted items (deep pink): item name = first word of the row
+            local nm = string.match(out[i], "^%s*([^%s{]+)")
+            local hl = (nm ~= nil and HIGHLIGHT[nm] == true)
+            if hls[i] ~= hl then
+                hls[i] = hl
+                invLines[i].Color = hl and HIGHLIGHT_COLOR or NORMAL_TEXT_COLOR
+            end
+        end
+        setInvLineCount(#out)
+    end
+end
+
+-- (own scope: Hotbar panel + team row; shares hbOK, hotbarStep, iconTest)
+local hbOK, hotbarStep
+do
+    ----------------------------------------------------------------------
+    -- EQUIPMENT HOTBAR (name pill on top, then the hotbar items row (only when a slot is
+    -- filled), then the equipment tiles, then the team card as the very last block; same
+    -- dark / purple colors as the other panels. The tile holding the player's EquippedTool
+    -- gets a brighter purple outline.)
+    -- Equipment: every name in ARMOR_ORDER is looked up DIRECTLY under
+    --   ReplicatedStorage.Players.<name>.Inventory
+    -- (no scan of every descendant). Each name is shown once.
+    -- Attachment rules (read from <item>.Attachments):
+    --   * FastMT with QuadNVG AND TitanShield is shown as a GMT (icon GMT.png)
+    --   * Altyn with MaskaVisor / AltynVisor shows that visor as a small icon in the
+    --     bottom-right corner of the Altyn tile (the Altyn stays the main icon)
+    -- Icons: downloaded once per item from the GitHub repo (jsDelivr first, raw
+    -- GitHub as fallback, see IMG_BASES) and cached. While an icon is missing /
+    -- loading, the tile shows the item name.
+    -- The files must be REAL images (PNG / JPEG). WebP files renamed to .png are
+    -- rejected (see imgKind / ALLOW_WEBP below).
+    -- Failed downloads are retried every IMG_RETRY seconds.
+    -- FADE: the whole panel fades in when it goes onto a player and fades out when it
+    -- goes off (see FADE_IN_TIME / FADE_OUT_TIME). The fade only runs while it is
+    -- animating; idle or hidden it costs one comparison per frame. With Performance
+    -- Mode on, the fade is skipped and the panel just appears / disappears.
+    -- "Hotbar Debug (prints)" (Debug Options) prints what the hotbar sees for the shown
+    -- player and why an icon is not loading.
+    ----------------------------------------------------------------------
+    local EQUIP_MAX_NODES = 1500    -- safety cap on objects looked at per debug scan
+    local EQUIP_REFRESH = 1.5       -- seconds between re-reads of the targeted player
+    -- Hosts tried in order for every icon (jsDelivr caches @main for a while: after
+    -- pushing new images, put the raw GitHub URL first or use a commit hash / tag).
+    local IMG_BASES = {
+        "https://cdn.jsdelivr.net/gh/123123123332221111/-x-Lp-6L-0-S-x-m-Z-2ZCi-Z@main/",
+        "https://raw.githubusercontent.com/123123123332221111/-x-Lp-6L-0-S-x-m-Z-2ZCi-Z/main/",
+    }
+    local IMG_RETRY = 60
+
+    local PAD = 12
+    local TILE, GAP, IMG_PAD = 64, 8, 4   -- bigger tiles so the icons are easy to see
+    local PILL_H, PILL_GAP = 24, 8        -- name pill on top, space under it
+    local SECTION_GAP = 8                 -- space between the stacked blocks
+    local TITLE_NUDGE_X = 2               -- name in the pill: + moves it right, - moves it left (px)
+    local CARD_PAD = 10                   -- padding inside the message / team cards
+    local MIN_W = 210                     -- only used for the very first position
+    local MAX_TILES = 10
+    local MAX_HOT = 7                    -- hotbar row: ItemBack1, ItemBack2, Hotbar4 .. Hotbar8
+    local HOT_REFRESH = 0.3              -- seconds between hotbar / equipped-tool re-reads (cheap, so fast)
+    -- slot names inside ReplicatedStorage.Players.<name>.Status.GameplayVariables.Hotbar
+    -- (capitalisation is ignored; an empty slot is simply not shown)
+    -- (the game also has "ItemHip1" = sidearm and "Melee" = knife slots; add them to this list to show them too.
+    --  MAX_HOT above must be at least the number of names in the list.)
+    local HOT_SLOTS = { "ItemBack1", "ItemBack2", "Hotbar4", "Hotbar5", "Hotbar6", "Hotbar7", "Hotbar8" }
+
+    local BG_COLOR = Color3.fromRGB(22, 22, 28)
+    local TILE_BG = Color3.fromRGB(30, 34, 48)   -- slightly blue, like the reference
+    local STROKE_COLOR = Color3.fromRGB(64, 72, 96) -- outline around each icon box
+    local EQUIPPED_STROKE = Color3.fromRGB(165, 135, 255) -- brighter purple outline on the item they are holding
+    local EQUIPPED_THICKNESS = 2
+    local HL_TILE = Color3.fromRGB(78, 22, 56)   -- tile tint for HIGHLIGHT items
+    local WHITE = Color3.fromRGB(255, 255, 255)
+    local GRAY = Color3.fromRGB(190, 190, 200)
+
+    -- Display order: head -> face -> body -> bags. Edit freely.
+    local ARMOR_ORDER = {
+        -- headgear
+        "ScavKingHelmet", "Altyn", "UNOHelmet", "6B47", "6B27", "FastMT",
+        "Pokushanka", "ZSh", "SSH68", "GMT", "Dozer",
+        "ScavKingCrown", "InflatedCrown", "MotorcycleHelmet", "TankerCap",
+        -- face / visors
+        "MaskaVisor", "AltynVisor", "ZShVisor", "FastVisor", "MikeShades", "IOLA", "Kulon",
+        "GP5", "GP7",
+        -- body armor / vests
+        "ScavKingVest", "IOTV4", "JPC", "HSPV", "Pantsir3", "DozerArmor",
+        "UNOVest", "TORS", "TWS", "6B5", "6B2", "6B23", "6B45",
+        "ConcealedVest", "Smersh", "Bandolier",
+        -- bags
+        "Attak5", "Lynx", "WastelandBackpack", "Wastelander", "Tortilla", "SpecopsBackpack",
+    }
+    local ARMOR_INDEX = {}
+    for i = 1, #ARMOR_ORDER do
+        if not ARMOR_INDEX[ARMOR_ORDER[i]] then ARMOR_INDEX[ARMOR_ORDER[i]] = i end
+    end
+
+    -- Attachment rules (the game item name stays the same, attachments change what is shown)
+    local SUB_SIZE = 18      -- small attachment icon size (px); up to 3 stack in one column
+    local ATT = {
+        fastmt = { "QuadNVG", "TitanShield" },                 -- FastMT with ALL of these is really a GMT
+        visors = { Altyn = { "MaskaVisor", "AltynVisor" } },   -- helmet -> visor corner icon (first one found wins)
+        gun = { "RK2", "Reapir", "PEQ15", "SOCOM556" },        -- gun attachments shown as stacked corner icons
+    }
+
+    ----------------------------------------------------------------------
+    -- Image cache + background downloader
+    ----------------------------------------------------------------------
+    -- item name in the game -> icon file name in the repo, for icons whose file name
+    -- differs. The normal "<ItemName>.png" is always tried first.
+    local IMG_ALIAS = {
+        SSH68 = "SSH668",
+        WastelandBackpack = "Wastelander",
+        ScavKingHelmet = "ScavKingCrown",
+    }
+
+    local imgData, imgState, imgFailAt, imgQueue = {}, {}, {}, {}
+    local imgInfo = {} -- [item] = size on success, reason on failure (for the debug button)
+    local imgDirty = false -- an icon finished loading -> tiles get re-applied
+
+    local function fetch(url)
+        if httpget then return httpget(url) end
+        return game:HttpGet(url)
+    end
+
+    -- Set to true to test whether Matcha can draw WebP directly (the icon files in
+    -- the repo were WebP renamed to .png, which Drawing.Image may not decode).
+    local ALLOW_WEBP = false
+
+    -- Looks at the first bytes of the download: "png", "jpg", "webp" or nil
+    local function imgKind(data)
+        if type(data) ~= "string" then return nil end
+        if string.sub(data, 2, 4) == "PNG" then return "png" end
+        if string.sub(data, 1, 2) == "\255\216" then return "jpg" end
+        if string.sub(data, 1, 4) == "RIFF" and string.sub(data, 9, 12) == "WEBP" then return "webp" end
+        return nil
+    end
+
+    local function isPng(data)
+        local k = imgKind(data)
+        return k == "png" or k == "jpg" or (ALLOW_WEBP and k == "webp")
+    end
+
+    local function requestImage(item)
+        local st = imgState[item]
+        if st == "ok" or st == "loading" then return end
+        if st == "fail" and tick() - imgFailAt[item] < IMG_RETRY then return end
+        imgState[item] = "loading"
+        imgQueue[#imgQueue + 1] = item
+    end
+
+    -- Tries every host in IMG_BASES for "<fileName>.png". Returns the data, or nil
+    -- plus the reason the last host failed.
+    local function tryDownload(fileName)
+        local why = "no hosts"
+        for i = 1, #IMG_BASES do
+            local ok, data = pcall(fetch, IMG_BASES[i] .. fileName .. ".png")
+            if ok and isPng(data) and #data > 100 then
+                return data
+            end
+            if not ok then
+                why = "error: " .. tostring(data)
+            elseif type(data) ~= "string" then
+                why = "returned " .. type(data)
+            elseif #data < 100 and string.sub(data, 1, 3) == "404" then
+                why = "404 not found (" .. fileName .. ".png is not in the repo)"
+            else
+                why = #data .. " bytes, format: " .. tostring(imgKind(data) or "unknown")
+            end
+        end
+        return nil, why
+    end
+
+    task.spawn(function()
+        while true do
+            local item = table.remove(imgQueue, 1)
+            if item then
+                local data, why = tryDownload(item)
+                if not data and IMG_ALIAS[item] then
+                    local d2, w2 = tryDownload(IMG_ALIAS[item])
+                    data = d2
+                    if not d2 then why = why .. " | " .. IMG_ALIAS[item] .. ": " .. tostring(w2) end
+                end
+                if not data then
+                    -- game names and file names can differ in capitalisation (FAL -> Fal.png)
+                    local alt = string.upper(string.sub(item, 1, 1)) .. string.lower(string.sub(item, 2))
+                    if alt ~= item and alt ~= IMG_ALIAS[item] then
+                        local d3, w3 = tryDownload(alt)
+                        data = d3
+                        if not d3 then why = why .. " | " .. alt .. ": " .. tostring(w3) end
+                    end
+                end
+                if data then
+                    imgData[item] = data
+                    imgState[item] = "ok"
+                    imgInfo[item] = #data .. " bytes"
+                    imgDirty = true
+                else
+                    imgState[item] = "fail"
+                    imgFailAt[item] = tick()
+                    imgInfo[item] = why
+                end
+                wait(0.05)
+            else
+                wait(0.25)
+            end
+        end
+    end)
+
+    ----------------------------------------------------------------------
+    -- Panel drawings
+    ----------------------------------------------------------------------
+    -- y = 44 keeps it below the compass bar at the top of the screen
+    local hbPanel = newPanel("hotbar", math.floor((Workspace.CurrentCamera.ViewportSize.X - MIN_W) / 2), 44, MIN_W, 60)
+
+    local rPill, rTitle, rMsgBg, rMsg, rTeamBg, rTeamHead
+    local tiles = {}            -- equipment row: per tile bg, stroke, img, label, subBg, sub (records), hasImg, hasSub, eq
+    local hotTiles = {}         -- hotbar-items row (same kind of tiles)
+    local rTeamRows = {}
+
+    local function make(class, props, ox, oy, isBg)
+        addItem(hbPanel, class, props, ox, oy, isBg)
+        return hbPanel.items[#hbPanel.items]
+    end
+
+    hbOK = pcall(function()
+        -- name pill (centered over the tiles, like the reference)
+        rPill = make("Square", {
+            Filled = true, Color = BG_COLOR,
+            Size = Vector2.new(100, PILL_H), ZIndex = 1, Visible = false,
+        }, 0, 0, true)
+        pcall(function() rPill.d.Corner = PILL_H / 2 end)
+
+        rTitle = make("Text", {
+            Text = "", Color = WHITE,
+            Font = Drawing.Fonts.SystemBold, Size = 12, Center = true,
+            ZIndex = 2, Visible = false,
+        }, 0, 0)
+
+        -- small card used for "Inventory not found" / "No equipment found"
+        rMsgBg = make("Square", {
+            Filled = true, Color = BG_COLOR,
+            Size = Vector2.new(100, 24), ZIndex = 1, Visible = false,
+        }, 0, 0, true)
+        pcall(function() rMsgBg.d.Corner = 8 end)
+        rMsg = make("Text", {
+            Text = "", Color = GRAY,
+            Font = Drawing.Fonts.System, Size = 13,
+            ZIndex = 2, Visible = false,
+        }, 0, 0)
+
+        local function makeTile()
+            local t = { hasImg = false, nsub = 0, subs = {}, subKey = nil, eq = false }
+
+            t.bg = make("Square", {
+                Filled = true, Color = TILE_BG,
+                Size = Vector2.new(TILE, TILE), ZIndex = 1, Visible = false,
+            }, 0, 0, true)
+            pcall(function() t.bg.d.Corner = 8 end)
+
+            -- outline around the box; registered as a "bg" drawing so the UI Opacity slider affects it
+            -- (turns brighter purple while the player is holding this item)
+            t.stroke = make("Square", {
+                Filled = false, Thickness = 1, Color = STROKE_COLOR,
+                Size = Vector2.new(TILE, TILE), ZIndex = 2, Visible = false,
+            }, 0, 0, true)
+            pcall(function() t.stroke.d.Corner = 8 end)
+
+            t.img = make("Image", {
+                Size = Vector2.new(TILE - IMG_PAD * 2, TILE - IMG_PAD * 2),
+                ZIndex = 2, Visible = false,
+            }, 0, 0)
+
+            t.label = make("Text", {
+                Text = "", Color = GRAY,
+                Font = Drawing.Fonts.SystemBold, Size = 10, Center = true,
+                ZIndex = 2, Visible = false,
+            }, 0, 0)
+
+            -- small attachment icons (bottom-right corner of the tile, stacked upward)
+            for k = 1, 4 do
+                local sb = make("Square", {
+                    Filled = true, Color = BG_COLOR,
+                    Size = Vector2.new(SUB_SIZE + 2, SUB_SIZE + 2), ZIndex = 3, Visible = false,
+                }, 0, 0, true)
+                pcall(function() sb.d.Corner = 4 end)
+                local si = make("Image", {
+                    Size = Vector2.new(SUB_SIZE, SUB_SIZE),
+                    ZIndex = 4, Visible = false,
+                }, 0, 0)
+                t.subs[k] = { bg = sb, img = si }
+            end
+
+            return t
+        end
+
+        for i = 1, MAX_TILES do tiles[i] = makeTile() end
+        for i = 1, MAX_HOT do hotTiles[i] = makeTile() end
+
+        -- team card: always the LAST block of the stack (only while "View Player Teams" is on)
+        rTeamBg = make("Square", {
+            Filled = true, Color = BG_COLOR,
+            Size = Vector2.new(100, 40), ZIndex = 1, Visible = false,
+        }, 0, 0, true)
+        pcall(function() rTeamBg.d.Corner = 8 end)
+        rTeamHead = make("Text", {
+            Text = "", Color = WHITE,
+            Font = Drawing.Fonts.SystemBold, Size = 12,
+            ZIndex = 2, Visible = false,
+        }, 0, 0)
+        for i = 1, TEAMS_MAX_ROWS do
+            rTeamRows[i] = make("Text", {
+                Text = "", Color = GRAY,
+                Font = Drawing.Fonts.System, Size = 12,
+                ZIndex = 2, Visible = false,
+            }, 0, 0)
+        end
+    end)
+
+    if not hbOK then
+        destroyPanel(hbPanel)
+        tiles, hotTiles = {}, {}
+    end
+
+    ----------------------------------------------------------------------
+    -- State + helpers (Visible is only written when it changes; Position only
+    -- for the drawings that are in use)
+    ----------------------------------------------------------------------
+    local shown = false
+    local eqCount = 0            -- tiles in the equipment row
+    local hotCount = 0           -- tiles in the hotbar-items row (0 = row hidden)
+    local tileItem = {}          -- [i] = item currently drawn in equipment tile i
+    local tileSub = {}           -- [i] = attachment icon name drawn in equipment tile i
+    local hotItem = {}           -- [i] = item currently drawn in hotbar tile i
+    local curEquipped = nil      -- name of the tool the targeted player is holding (EquippedTool)
+    local titleStr, msgStr = "Hotbar", ""
+    local teamOn = false
+    local teamHeadStr = ""
+    local teamRowStr, teamRowCount = {}, 0
+
+    -- Fade in / out (the panel stays drawn until the fade-out finishes)
+    -- (stored as fields on hbPanel instead of locals: this chunk is at Lua's 200-local limit)
+    hbPanel.fin = 0.18   -- seconds to fade in
+    hbPanel.fout = 0.12  -- seconds to fade out
+    hbPanel.fa = 0       -- current fade amount (0 = hidden, 1 = fully shown)
+    hbPanel.ft = 0       -- fade target
+    hbPanel.fl = nil     -- last frame time
+    hbPanel.fade = 0     -- eased value used by applyOpacity
+
+    local function setVis(r, v)
+        v = v and true or false
+        if r.vis ~= v then
+            r.vis = v
+            r.d.Visible = v
+        end
+    end
+
+    local function put(r)
+        r.d.Position = Vector2.new(hbPanel.x + r.ox, hbPanel.y + r.oy)
+    end
+
+    local function setRowVisible(list, count, s)
+        for i = 1, #list do
+            local t = list[i]
+            local on = s and i <= count
+            setVis(t.bg, on)
+            setVis(t.stroke, on)
+            setVis(t.img, on and t.hasImg)
+            setVis(t.label, on and not t.hasImg)
+            for k = 1, #t.subs do
+                local sv = on and k <= t.nsub
+                setVis(t.subs[k].bg, sv)
+                setVis(t.subs[k].img, sv)
+            end
+        end
+    end
+
+    local function putRow(list, count)
+        for i = 1, count do
+            local t = list[i]
+            put(t.bg)
+            put(t.stroke)
+            if t.hasImg then put(t.img) else put(t.label) end
+            for k = 1, t.nsub do put(t.subs[k].bg); put(t.subs[k].img) end
+        end
+    end
+
+    local function applyVisibility()
+        local s = shown or hbPanel.fa > 0 -- stays drawn while it fades out
+        local noGear = s and eqCount == 0
+        setVis(rPill, s)
+        setVis(rTitle, s)
+        setVis(rMsgBg, noGear)
+        setVis(rMsg, noGear)
+        setRowVisible(hotTiles, hotCount, s)
+        setRowVisible(tiles, eqCount, s)
+        local tv = s and teamOn
+        setVis(rTeamBg, tv)
+        setVis(rTeamHead, tv)
+        for i = 1, TEAMS_MAX_ROWS do
+            setVis(rTeamRows[i], tv and i <= teamRowCount)
+        end
+    end
+
+    -- Writes Transparency from the fade value (smoothstep ease, like the notification slide).
+    -- allItems = false: only drawings that are currently visible are touched.
+    function hbPanel.writeFade(allItems)
+        local a = hbPanel.fa
+        local e = a * a * (3 - 2 * a)
+        hbPanel.fade = e
+        local bgA, fgA = bgAlpha() * e, fgAlpha() * e
+        local items = hbPanel.items
+        for i = 1, #items do
+            local it = items[i]
+            if allItems or it.vis then
+                it.d.Transparency = it.bg and bgA or fgA
+            end
+        end
+    end
+
+    function hbPanel.fadeTo(target)
+        if target == hbPanel.ft then return end
+        hbPanel.ft = target
+        -- starting from fully hidden: set everything to invisible BEFORE it is shown (no one-frame flash)
+        if target == 1 and hbPanel.fa == 0 then hbPanel.writeFade(true) end
+    end
+
+    RunService.RenderStepped:Connect(function()
+        guarded(function()
+            local a, target = hbPanel.fa, hbPanel.ft
+            if a == target then hbPanel.fl = nil return end -- idle: no work
+
+            -- Performance Mode: skip the fade and jump straight to the target
+            if Notification.perf then
+                hbPanel.fa = target
+                hbPanel.fl = nil
+                hbPanel.writeFade(true)
+                if target == 0 then applyVisibility() end -- fully hidden: actually hide everything
+                return
+            end
+
+            local now = tick()
+            local last = hbPanel.fl
+            local dt = last and (now - last) or 0
+            hbPanel.fl = now
+            if dt > 0.05 then dt = 0.05 end -- lag spike protection
+
+            if target > a then
+                a = a + dt / hbPanel.fin
+                if a > 1 then a = 1 end
+            else
+                a = a - dt / hbPanel.fout
+                if a < 0 then a = 0 end
+            end
+            hbPanel.fa = a
+
+            hbPanel.writeFade(a == 1)                -- on completion, also refresh hidden drawings
+            if a == 0 then applyVisibility() end     -- fade-out done: actually hide everything
+        end)
+    end)
+
+    -- Recomputes size + offsets (only called when something changed), keeps the
+    -- panel centered on its current middle, then writes the positions in use.
+    -- The panel is a vertical stack of blocks, every block centered:
+    --   1) name pill
+    --   2) hotbar items (ItemBack1/2, Hotbar4-8)  <- only when at least one slot is filled
+    --   3) equipment tiles (or a message card)
+    --   4) team card  <- always the very last block
+    local function layout()
+        applyVisibility() -- hide stale stuff first
+
+        local n = eqCount
+        local hn = hotCount
+        local pillW = #titleStr * 6 + 36   -- same padding left and right of the centered name
+        local hotW = (hn > 0) and (hn * TILE + (hn - 1) * GAP) or 0
+        local tilesW = (n > 0) and (n * TILE + (n - 1) * GAP) or 0
+        local msgW = (n == 0) and (#msgStr * 6.5 + PAD * 2) or 0
+        local teamW = 0
+        if teamOn then
+            teamW = #teamHeadStr * 7
+            for i = 1, teamRowCount do
+                local w = #teamRowStr[i] * 6.5
+                if w > teamW then teamW = w end
+            end
+            teamW = teamW + CARD_PAD * 2
+        end
+
+        local W = pillW
+        if hotW > W then W = hotW end
+        if tilesW > W then W = tilesW end
+        if msgW > W then W = msgW end
+        if teamW > W then W = teamW end
+        W = math.floor(W)
+
+        if W ~= hbPanel.w then
+            hbPanel.x = hbPanel.x + (hbPanel.w - W) / 2
+            hbPanel.w = W
+        end
+
+        local function cx(w) return math.floor((W - w) / 2) end
+
+        -- places one row of tiles (centered) with its top edge at `top`
+        local function placeRow(list, count, top)
+            local x0 = cx(count * TILE + (count - 1) * GAP)
+            for i = 1, count do
+                local t = list[i]
+                local x = x0 + (i - 1) * (TILE + GAP)
+                t.bg.ox, t.bg.oy = x, top
+                t.stroke.ox, t.stroke.oy = x, top
+                t.img.ox, t.img.oy = x + IMG_PAD, top + IMG_PAD
+                t.label.ox, t.label.oy = x + TILE / 2, top + TILE / 2 - 1   -- Center = true centers on both axes
+                -- small attachment icons: bottom-right corner, 3 per column stacked upward,
+                -- a 4th icon starts a second column to the left
+                for k = 1, #t.subs do
+                    local col, row = math.floor((k - 1) / 3), (k - 1) % 3
+                    local bx = x + TILE - (SUB_SIZE + 2) - 2 - col * (SUB_SIZE + 3)
+                    local by = top + TILE - (SUB_SIZE + 2) - 2 - row * (SUB_SIZE + 3)
+                    t.subs[k].bg.ox, t.subs[k].bg.oy = bx, by
+                    t.subs[k].img.ox, t.subs[k].img.oy = bx + 1, by + 1
+                end
+            end
+        end
+
+        -- 1) name pill
+        local pillX = cx(pillW)
+        rPill.ox, rPill.oy = pillX, 0
+        rPill.d.Size = Vector2.new(pillW, PILL_H)
+        -- Center = true centers the text on BOTH axes (x and y are its middle point), so y is the pill's middle
+        rTitle.ox, rTitle.oy = pillX + pillW / 2 + TITLE_NUDGE_X, PILL_H / 2 - 1
+        -- only the pill grabs the mouse for dragging (see dragStep)
+        hbPanel.hx, hbPanel.hw = pillX, pillW
+        local y = PILL_H + PILL_GAP
+
+        -- 2) hotbar items: only shown when at least one slot has something in it
+        if hn > 0 then
+            placeRow(hotTiles, hn, y)
+            y = y + TILE + SECTION_GAP
+        end
+
+        -- 3) equipment tiles, or a small message card when there is nothing to show
+        if n > 0 then
+            placeRow(tiles, n, y)
+            y = y + TILE
+        else
+            local mx = cx(msgW)
+            rMsgBg.ox, rMsgBg.oy = mx, y
+            rMsgBg.d.Size = Vector2.new(msgW, 24)
+            rMsg.ox, rMsg.oy = mx + PAD, y + 5
+            y = y + 24
+        end
+
+        -- 4) team card: ALWAYS the last block, under everything else
+        if teamOn then
+            y = y + SECTION_GAP
+            local cardX = cx(teamW)
+            local cardH = CARD_PAD * 2 + 14 + ((teamRowCount > 0) and (4 + teamRowCount * 14) or 0)
+            rTeamBg.ox, rTeamBg.oy = cardX, y
+            rTeamBg.d.Size = Vector2.new(teamW, cardH)
+            rTeamHead.ox, rTeamHead.oy = cardX + CARD_PAD, y + CARD_PAD
+            for i = 1, teamRowCount do
+                rTeamRows[i].ox, rTeamRows[i].oy = cardX + CARD_PAD, y + CARD_PAD + 14 + 4 + (i - 1) * 14
+            end
+            y = y + cardH
+        end
+
+        hbPanel.h = y
+
+        -- positions of the drawings in use
+        put(rPill); put(rTitle)
+        if n == 0 then put(rMsgBg); put(rMsg) end
+        putRow(hotTiles, hn)
+        putRow(tiles, n)
+        if teamOn then
+            put(rTeamBg); put(rTeamHead)
+            for i = 1, teamRowCount do put(rTeamRows[i]) end
+        end
+    end
+
+    local function shortName(name)
+        if #name > 9 then return string.sub(name, 1, 7) .. ".." end
+        return name
+    end
+
+    -- colors + icon of one tile; isEq = the player is holding this item right now;
+    -- sub = optional small corner icon (attachment)
+    local function styleTile(t, item, isEq, sub)
+        t.eq = isEq
+        t.bg.d.Color = HIGHLIGHT[item] and HL_TILE or TILE_BG
+        t.stroke.d.Color = isEq and EQUIPPED_STROKE or STROKE_COLOR
+        t.stroke.d.Thickness = isEq and EQUIPPED_THICKNESS or 1
+        if imgState[item] == "ok" then
+            t.img.d.Data = imgData[item]
+            t.hasImg = true
+        else
+            t.hasImg = false
+            t.label.d.Text = shortName(item)
+        end
+        -- sub = comma separated icon names ("RK2,PEQ15"), or a single name, or nil
+        t.subKey = sub or ""
+        local ns = 0
+        if sub and sub ~= "" then
+            for nm in string.gmatch(sub, "[^,]+") do
+                if ns >= #t.subs then break end
+                if imgState[nm] == "ok" then
+                    ns = ns + 1
+                    t.subs[ns].img.d.Data = imgData[nm]
+                end
+            end
+        end
+        t.nsub = ns
+    end
+
+    local function applyTile(i, item, sub)
+        tileItem[i] = item
+        tileSub[i] = sub
+        styleTile(tiles[i], item, curEquipped ~= nil and item == curEquipped, sub)
+    end
+
+    ----------------------------------------------------------------------
+    -- Reading the equipment
+    ----------------------------------------------------------------------
+    local function hasAll(atts, names)
+        for i = 1, #names do
+            if not atts:FindFirstChild(names[i]) then return false end
+        end
+        return true
+    end
+
+    -- Looks up every name from ARMOR_ORDER directly under Inventory (no descendant scan).
+    -- out[i] = icon/display name (FastMT may become GMT), subOut[i] = small corner icon or nil
+    -- Returns found, n.
+    local function readEquipment(name, out, subOut)
+        local folder = getPlayersFolder()
+        local inv = folder and folder:FindFirstChild(name)
+        inv = inv and inv:FindFirstChild("Inventory")
+        if not inv then return false, 0 end
+
+        local n = 0
+        for i = 1, #ARMOR_ORDER do
+            if n >= MAX_TILES then break end
+            local gear = ARMOR_ORDER[i]
+            local inst = inv:FindFirstChild(gear)
+            if inst then
+                local shownName, sub = gear, nil
+                local atts = inst:FindFirstChild("Attachments")
+                if atts then
+                    if gear == "FastMT" then
+                        if hasAll(atts, ATT.fastmt) then shownName = "GMT" end
+                    else
+                        local visors = ATT.visors[gear]
+                        if visors then
+                            for v = 1, #visors do
+                                if atts:FindFirstChild(visors[v]) then
+                                    sub = visors[v]
+                                    break
+                                end
+                            end
+                        end
+                    end
+                end
+
+                local dup = false -- e.g. a real GMT next to a FastMT shown as GMT
+                for k = 1, n do
+                    if out[k] == shownName then dup = true break end
+                end
+                if not dup then
+                    n = n + 1
+                    out[n] = shownName
+                    subOut[n] = sub
+                end
+            end
+        end
+        return true, n
+    end
+
+    ----------------------------------------------------------------------
+    -- TEAMS: ReplicatedStorage.Clans.<leader>'s team.<member>
+    -- Every child of Clans is a team folder; the players inside it (anywhere below
+    -- the folder) are its members. A name only counts as a member when it matches a
+    -- player that is in game.Players, so stray values inside the folders are never
+    -- counted. The leader (taken from the folder name "<leader>'s team") counts as a
+    -- member too, even if they are not listed inside the folder.
+    ----------------------------------------------------------------------
+    local clansFolder
+
+    local function getClansFolder()
+        if not clansFolder or clansFolder.Parent == nil then
+            clansFolder = ReplicatedStorage:FindFirstChild("Clans")
+        end
+        return clansFolder
+    end
+
+    -- Returns the team folder name and the sorted list of member names for `name`,
+    -- or nil if they are in no team
+    local function findTeam(name)
+        local clans = getClansFolder()
+        if not clans then return nil end
+
+        local teams = clans:GetChildren()
+        for i = 1, #teams do
+            local team = teams[i]
+            local leader = string.match(team.Name, "^(.+)'s [Tt]eam$")
+            local desc = team:GetDescendants()
+            local limit = #desc
+            if limit > TEAMS_MAX_NODES then limit = TEAMS_MAX_NODES end
+
+            local seen, members = {}, {}
+            local inTeam = (leader == name)
+            if leader and Players:FindFirstChild(leader) then
+                seen[leader] = true
+                members[1] = leader
+            end
+            for j = 1, limit do
+                local n = desc[j].Name
+                if n == name then inTeam = true end
+                if not seen[n] and Players:FindFirstChild(n) then
+                    seen[n] = true
+                    members[#members + 1] = n
+                end
+            end
+
+            if inTeam then
+                table.sort(members)
+                return team.Name, members
+            end
+        end
+        return nil
+    end
+
+    -- Returns the team line and the member-name rows for `name`
+    local function teamInfo(name)
+        if not getClansFolder() then return "Team: unknown", {} end
+        local teamName, members = findTeam(name)
+        if not teamName then return "Team: none", {} end
+
+        local count = #members
+        local header = "Team: " .. teamName .. "  -  " .. count .. (count == 1 and " member" or " members")
+
+        -- pack the names into rows of about TEAMS_LINE_CHARS characters
+        local rows, rowNames = {}, {}
+        local line, lineCount = "", 0
+        for i = 1, count do
+            local nm = members[i]
+            local candidate = (line == "") and nm or (line .. ", " .. nm)
+            if line ~= "" and #candidate > TEAMS_LINE_CHARS then
+                rows[#rows + 1] = line
+                rowNames[#rowNames + 1] = lineCount
+                line, lineCount = nm, 1
+            else
+                line, lineCount = candidate, lineCount + 1
+            end
+        end
+        if line ~= "" then
+            rows[#rows + 1] = line
+            rowNames[#rowNames + 1] = lineCount
+        end
+
+        -- more names than rows: keep the first rows and say how many are left out
+        if #rows > TEAMS_MAX_ROWS then
+            local shownNames = 0
+            for i = 1, TEAMS_MAX_ROWS - 1 do shownNames = shownNames + rowNames[i] end
+            for i = #rows, TEAMS_MAX_ROWS, -1 do rows[i] = nil end
+            rows[TEAMS_MAX_ROWS] = "+" .. (count - shownNames) .. " more"
+        end
+        return header, rows
+    end
+
+    ----------------------------------------------------------------------
+    -- Called from infoStep (every INFO_SELECT_EVERY seconds)
+    ----------------------------------------------------------------------
+    ----------------------------------------------------------------------
+    -- HOTBAR + EQUIPPED TOOL
+    --   ReplicatedStorage.Players.<name>.Status.GameplayVariables.Hotbar.<slot>
+    --   ReplicatedStorage.Players.<name>.Status.GameplayVariables.EquippedTool
+    -- A slot / the tool can be stored as a String/Object value, as an attribute, or as an
+    -- item sitting inside the slot; all of those are understood (use "Hotbar Debug" to see
+    -- what the game really uses). Empty / missing slots are skipped.
+    ----------------------------------------------------------------------
+    -- turns a stored value (string, or an instance such as an ObjectValue target) into an item name
+    -- (an EMPTY ObjectValue gives the placeholder name "Unreadable_name": that counts as empty)
+    local function nameOf(v)
+        if v == nil then return nil end
+        if type(v) == "string" then
+            if v == "" or v == "Unreadable_name" then return nil end
+            return v
+        end
+        if type(v) == "number" or type(v) == "boolean" then return nil end
+        local ok, nm = pcall(function() return v.Name end)
+        if ok and type(nm) == "string" and nm ~= "" and nm ~= "Unreadable_name" then return nm end
+        return nil
+    end
+
+    -- FindFirstChild that ignores capitalisation (the slots are called Itemback1 / ItemBack1 ...)
+    local function findCI(parent, name)
+        local c = parent:FindFirstChild(name)
+        if c then return c end
+        local lower = string.lower(name)
+        local kids = parent:GetChildren()
+        for i = 1, #kids do
+            if string.lower(kids[i].Name) == lower then return kids[i] end
+        end
+        return nil
+    end
+
+    -- item name stored under <parent>.<key>, or nil when empty / missing
+    local function readItemName(parent, key)
+        local n = nameOf(parent:GetAttribute(key))
+        if n then return n end
+        local c = findCI(parent, key)
+        if not c then return nil end
+        local okv, v = pcall(function() return c.Value end)
+        if okv then
+            n = nameOf(v)
+            if n then return n end
+        end
+        local kids = c:GetChildren()
+        if #kids > 0 then return kids[1].Name end
+        return nil
+    end
+
+    local function gameplayVars(name)
+        local folder = getPlayersFolder()
+        local n = folder and folder:FindFirstChild(name)
+        n = n and n:FindFirstChild("Status")
+        return n and n:FindFirstChild("GameplayVariables")
+    end
+
+    -- Fills out[1..n] with the items in the hotbar slots (slot order, empty slots skipped).
+    -- Returns n and the name of the held tool (nil when nothing is equipped).
+    local function readHotbar(name, out)
+        local gv = gameplayVars(name)
+        if not gv then return 0, nil end
+        local src = findCI(gv, "Hotbar") or gv
+        local n = 0
+        for i = 1, #HOT_SLOTS do
+            local item = readItemName(src, HOT_SLOTS[i])
+            if item then
+                n = n + 1
+                out[n] = item
+            end
+        end
+        return n, readItemName(gv, "EquippedTool")
+    end
+
+    -- An M4 with ALL of Reapir + PEQ15 + Mag556Rnd100 + SOCOM556 under Inventory.M4.Attachments is a GODM4
+    -- (icon GODM4.png). Only called when a hotbar slot holds an "M4".
+    local function isGodM4(name)
+        local folder = getPlayersFolder()
+        local m4 = folder and folder:FindFirstChild(name)
+        m4 = m4 and m4:FindFirstChild("Inventory")
+        m4 = m4 and m4:FindFirstChild("M4")
+        local atts = m4 and m4:FindFirstChild("Attachments")
+        if not atts then return false end
+        return atts:FindFirstChild("Reapir") ~= nil
+            and atts:FindFirstChild("PEQ15") ~= nil
+            and atts:FindFirstChild("Mag556Rnd100") ~= nil
+            and atts:FindFirstChild("SOCOM556") ~= nil
+    end
+
+    -- Comma separated list of the ATT.gun attachments found anywhere under Inventory.<gun>.Attachments
+    -- (in ATT.gun order, e.g. "RK2,PEQ15"), or nil when there are none.
+    local function gunAtts(name, gun)
+        local folder = getPlayersFolder()
+        local g = folder and folder:FindFirstChild(name)
+        g = g and g:FindFirstChild("Inventory")
+        g = g and g:FindFirstChild(gun)
+        local atts = g and g:FindFirstChild("Attachments")
+        if not atts then return nil end
+        -- look through everything under Attachments, so nested ones count too
+        -- (e.g. Inventory.M4.Attachments.FrontMK12.Attachments.RK2); works for any gun
+        local d = atts:GetDescendants()
+        local key
+        local list = ATT.gun
+        for i = 1, #list do
+            for j = 1, #d do
+                if d[j].Name == list[i] then
+                    key = key and (key .. "," .. list[i]) or list[i]
+                    break
+                end
+            end
+        end
+        return key
+    end
+
+    local hotTarget, hotLastRead = nil, 0
+    local hotRead = {}
+
+    local curTarget, lastRead = nil, 0
+    local teamTarget, teamLastRead = nil, 0
+    local eqRead, eqSub = {}, {}
+
+    function hotbarStep(target, now, wantTeams, wantAtt)
+        if not hbOK then return end
+        local dirty = false
+
+        local wantTeamRow = (wantTeams and target ~= nil) and true or false
+        if target == nil and hbPanel.fa > 0 then wantTeamRow = teamOn end -- keep the team card while fading out
+        if wantTeamRow ~= teamOn then
+            teamOn = wantTeamRow
+            if teamOn then teamTarget = nil end -- read right away
+            dirty = true
+        end
+
+        if target then
+            if imgDirty then
+                imgDirty = false
+                for i = 1, MAX_TILES do tileItem[i] = nil; tileSub[i] = nil end -- re-apply tiles with the new icons
+                for i = 1, MAX_HOT do hotItem[i] = nil end
+                lastRead = 0
+                hotLastRead = 0
+            end
+
+            if target ~= curTarget or now - lastRead >= EQUIP_REFRESH or hbPanel.att ~= wantAtt then
+                curTarget = target
+                lastRead = now
+                hbPanel.att = wantAtt -- remembers the toggle so flipping it updates right away
+
+                local found, n = readEquipment(target, eqRead, eqSub)
+
+                local title = target
+                if title ~= titleStr then
+                    titleStr = title
+                    rTitle.d.Text = title
+                    dirty = true
+                end
+
+                local msg = ""
+                if not found then
+                    msg = "Inventory not found"
+                elseif n == 0 then
+                    msg = "No equipment found"
+                end
+                if msg ~= msgStr then
+                    msgStr = msg
+                    if msg ~= "" then rMsg.d.Text = msg end
+                    dirty = true
+                end
+
+                if n ~= eqCount then
+                    eqCount = n
+                    dirty = true
+                end
+                for i = 1, n do
+                    local item, sub = eqRead[i], eqSub[i]
+                    if not wantAtt then sub = nil end -- "Attachment Icons" is off: no corner icons
+                    if tileItem[i] ~= item or tileSub[i] ~= sub then
+                        applyTile(i, item, sub)
+                        dirty = true
+                    end
+                    -- still no icon: (re)request it; retries are throttled by IMG_RETRY
+                    if not tiles[i].hasImg then requestImage(item) end
+                    if sub then requestImage(sub) end
+                end
+            end
+
+            -- hotbar slots + equipped tool (fast refresh so weapon swaps show up quickly)
+            if target ~= hotTarget or now - hotLastRead >= HOT_REFRESH then
+                hotTarget = target
+                hotLastRead = now
+
+                local hn, equipped = readHotbar(target, hotRead)
+                if hn > MAX_HOT then hn = MAX_HOT end
+                curEquipped = equipped
+
+                if hn ~= hotCount then
+                    hotCount = hn
+                    dirty = true
+                end
+
+                local used = false -- only the first tile with the held item gets the "equipped" look
+                for i = 1, hn do
+                    local raw = hotRead[i]          -- name in the game files
+                    local item = raw                -- name / icon shown
+                    local key = nil                 -- attachment corner icons
+                    if raw == "M4" and isGodM4(target) then
+                        item = "GODM4"              -- the GODM4 icon already covers its attachments
+                    elseif wantAtt then
+                        key = gunAtts(target, raw)
+                    end
+                    local isEq = false
+                    if not used and curEquipped ~= nil and raw == curEquipped then
+                        isEq = true
+                        used = true
+                    end
+                    local t = hotTiles[i]
+                    if hotItem[i] ~= item or t.eq ~= isEq or t.subKey ~= (key or "") then
+                        hotItem[i] = item
+                        styleTile(t, item, isEq, key)
+                        dirty = true
+                    end
+                    if not t.hasImg then requestImage(item) end
+                    if key then
+                        for nm in string.gmatch(key, "[^,]+") do requestImage(nm) end
+                    end
+                end
+
+                -- the equipment row can show the held item too
+                for i = 1, eqCount do
+                    local isEq = (curEquipped ~= nil and tileItem[i] == curEquipped)
+                    if tiles[i].eq ~= isEq then
+                        styleTile(tiles[i], tileItem[i], isEq, tileSub[i])
+                        dirty = true
+                    end
+                end
+            end
+
+            if teamOn and (target ~= teamTarget or now - teamLastRead >= TEAMS_REFRESH) then
+                teamTarget = target
+                teamLastRead = now
+                local text, rows = teamInfo(target)
+                if text ~= teamHeadStr then
+                    teamHeadStr = text
+                    rTeamHead.d.Text = text
+                end
+                for i = 1, #rows do
+                    if teamRowStr[i] ~= rows[i] then
+                        teamRowStr[i] = rows[i]
+                        rTeamRows[i].d.Text = rows[i]
+                    end
+                end
+                teamRowCount = #rows
+                dirty = true
+            end
+
+            if not shown then
+                shown = true
+                hbPanel.shown = true
+                hbPanel.fadeTo(1)
+                dirty = true
+            end
+        else
+            curTarget = nil
+            teamTarget = nil
+            hotTarget = nil
+            curEquipped = nil
+            if shown then
+                shown = false
+                hbPanel.shown = false
+                hbPanel.fadeTo(0)
+                dirty = true
+            end
+        end
+
+        if dirty then layout() end
+    end
+
+    -- "Hotbar Debug" button: prints what the hotbar sees for the player it is showing
+    iconTest = function()
+        task.spawn(function()
+            -- does this Matcha build have a draw.LoadImage (like some other scripts use)?
+            local okD, hasLoad = pcall(function() return draw ~= nil and draw.LoadImage ~= nil end)
+            print("[Hotbar debug] draw.LoadImage available: " .. tostring(okD and hasLoad))
+
+            local target = curTarget
+            print("[Hotbar debug] target: " .. tostring(target) .. ", tiles in use: " .. eqCount)
+            if not target then
+                print("[Hotbar debug] no target - look at a player (or use Hotbar Target = Myself), then click again")
+                return
+            end
+
+            -- GameplayVariables / Hotbar / EquippedTool: what the hotbar row reads
+            local okG, errG = pcall(function()
+                local gv = gameplayVars(target)
+                if not gv then
+                    print("[Hotbar debug] no Status.GameplayVariables found for " .. target)
+                    return
+                end
+                local function describe(inst)
+                    local okv, v = pcall(function() return inst.Value end)
+                    local kids = inst:GetChildren()
+                    return inst.Name .. " [" .. inst.ClassName .. "]"
+                        .. (okv and (" = " .. tostring(v)) or "")
+                        .. ((#kids > 0) and (" (" .. #kids .. " children)") or "")
+                end
+                local list = gv:GetChildren()
+                for i = 1, #list do
+                    print("[Hotbar debug] GameplayVariables: " .. describe(list[i]))
+                end
+                local hb = findCI(gv, "Hotbar")
+                if hb then
+                    local slots = hb:GetChildren()
+                    for i = 1, #slots do
+                        print("[Hotbar debug] Hotbar slot: " .. describe(slots[i]))
+                    end
+                else
+                    print("[Hotbar debug] no Hotbar child in GameplayVariables (slots are read from GameplayVariables itself)")
+                end
+                local hn, eq = readHotbar(target, hotRead)
+                local names = {}
+                for i = 1, hn do names[#names + 1] = hotRead[i] end
+                print("[Hotbar debug] hotbar items read (" .. hn .. "): " .. table.concat(names, ", ")
+                    .. " | equipped tool: " .. tostring(eq))
+            end)
+            if not okG then print("[Hotbar debug] GameplayVariables error: " .. tostring(errG)) end
+
+            local ok, err = pcall(function()
+                local folder = getPlayersFolder()
+                local inv = folder and folder:FindFirstChild(target)
+                inv = inv and inv:FindFirstChild("Inventory")
+                if not inv then
+                    print("[Hotbar debug] no Inventory found for " .. target)
+                    return
+                end
+                local kids = inv:GetChildren()
+                local names = {}
+                for i = 1, #kids do names[#names + 1] = kids[i].Name end
+                print("[Hotbar debug] Inventory children (" .. #kids .. "): " .. table.concat(names, ", "))
+
+                local d = inv:GetDescendants()
+                local limit = #d
+                if limit > EQUIP_MAX_NODES then limit = EQUIP_MAX_NODES end
+                print("[Hotbar debug] descendants: " .. #d .. ", scanned: " .. limit)
+                for i = 1, limit do
+                    if ARMOR_INDEX[d[i].Name] then
+                        print("[Hotbar debug] gear found at: " .. d[i]:GetFullName())
+                    end
+                end
+            end)
+            if not ok then print("[Hotbar debug] scan error: " .. tostring(err)) end
+
+            for i = 1, eqCount do
+                local item = tileItem[i]
+                if item then
+                    print("[Hotbar debug] tile " .. i .. ": " .. item .. " | icon: " .. tostring(imgState[item])
+                        .. " | " .. tostring(imgInfo[item]) .. " | drawn as image: " .. tostring(tiles[i].hasImg)
+                        .. " | corner icon: " .. tostring(tileSub[i]))
+                end
+            end
+
+            for i = 1, hotCount do
+                local item = hotItem[i]
+                if item then
+                    print("[Hotbar debug] hotbar tile " .. i .. ": " .. item .. " | icon: " .. tostring(imgState[item])
+                        .. " | " .. tostring(imgInfo[item]) .. " | equipped look: " .. tostring(hotTiles[i].eq))
+                end
+            end
+
+            -- direct download test of the first tile that has no icon yet
+            for i = 1, eqCount do
+                local item = tileItem[i]
+                if item and not tiles[i].hasImg then
+                    local url = IMG_BASES[2] .. item .. ".png"
+                    print("[Hotbar debug] test download: " .. url)
+                    local ok2, data = pcall(fetch, url)
+                    if not ok2 then
+                        print("[Hotbar debug] request failed: " .. tostring(data))
+                    elseif type(data) ~= "string" then
+                        print("[Hotbar debug] returned " .. type(data))
+                    else
+                        print("[Hotbar debug] returned " .. #data .. " bytes, format: " .. tostring(imgKind(data) or "unknown"))
+                        if not isPng(data) then
+                            print("[Hotbar debug] starts with: " .. (string.gsub(string.sub(data, 1, 60), "[^%w%p ]", "?")))
+                        end
+                    end
+                    break
+                end
+            end
+            print("[Hotbar debug] done")
+        end)
+    end
+end
+
+----------------------------------------------------------------------
+-- Shared step: one "looked-at player" pick feeds all panels
+----------------------------------------------------------------------
+local infoTarget, infoLastRead = nil, 0
+local invTarget, invLastRead = nil, 0
+
+local function infoStep()
+    local wantInfo = panelOK and UI.GetValue("opt_info")
+    local wantInv = invOK and UI.GetValue("opt_inv")
+    local wantHotbar = hbOK and UI.GetValue("opt_hotbar")
+    local wantTeams = UI.GetValue("opt_teams") == true
+    local wantAtt = UI.GetValue("opt_attico") == true
+    local hbSelf = UI.GetValue("hotbar_target") == 1
+
+    local needLook = wantInfo or wantInv or (wantHotbar and not hbSelf)
+    local target = needLook and findLookedAtPlayer() or nil
+    local now = tick()
+
+    -- Player Info (re-read only when the target changes or every INFO_REFRESH seconds)
+    if wantInfo and target then
+        if target ~= infoTarget or now - infoLastRead >= INFO_REFRESH then
+            infoTarget = target
+            infoLastRead = now
+            local reportsStr, playStr = readPlayerInfo(target)
+            updateInfoPanel(target, reportsStr, playStr)
+        end
+        showInfoPanel(true)
+    else
+        infoTarget = nil
+        showInfoPanel(false)
+    end
+
+    -- Inv Aim
+    if wantInv and target then
+        if target ~= invTarget or now - invLastRead >= INFO_REFRESH then
+            invTarget = target
+            invLastRead = now
+            updateInvPanel(target)
+        end
+        showInvPanel(true)
+    else
+        invTarget = nil
+        showInvPanel(false)
+    end
+
+    -- Hotbar (looked-at player, or yourself)
+    if wantHotbar then
+        hotbarStep(hbSelf and LOCAL_NAME or target, now, wantTeams, wantAtt)
+    else
+        hotbarStep(nil, now, false, false)
+    end
+end
+
+task.spawn(function()
+    while true do
+        guarded(infoStep)
+        wait(INFO_SELECT_EVERY)
+    end
+end)
+
+-- (own scope: Staff List panel + God Mode detection; shares slOK)
+local slOK
+do
+    ----------------------------------------------------------------------
+    -- STAFF LIST PANEL (bottom-left by default)
+    -- Header "Scanning for staff", then only the usernames of players who have a
+    -- Early Access flag (EarlyAccessUser on ReplicatedStorage.Players.<name>, with
+    -- Status.Purchases.Passes.GivenEarlyAccess as the failsafe).
+    -- Matcha has no Players.PlayerAdded / PlayerRemoving events (they are nil), so
+    -- game.Players is checked once a second. Only NEW players get their Passes read
+    -- (retried for up to SL_MAX_TRIES seconds in case the Passes folder loads a
+    -- moment after they join); players who left are dropped from the list.
+    -- Other players found with a tag also get a [POSSIBLE MOD] label and a
+    -- notification box.
+    -- GOD MODE (second failsafe): ReplicatedStorage.Players.<name>.Status.
+    -- GameplayVariables.GodMode (BoolValue). It is read for every player in the same
+    -- once-a-second scan. While it is on:
+    --   * the player is listed as "<name> - God Mode" (orange) in this panel
+    --   * their label becomes an orange "God Moded" (instead of [POSSIBLE MOD])
+    --   * a red notification box appears when it turns on
+    -- The panel is bottom-anchored: it grows upward as names are added.
+    ----------------------------------------------------------------------
+    local STAFF_LIST_INCLUDE_SELF = true -- TEST: lets you see yourself in the list; set to false later
+    local SL_MAX_ROWS = 10
+    local SL_ROW_H = 16
+    local SL_X, SL_W, SL_MARGIN = 20, 260, 20
+    local SL_MAX_TRIES = 20
+
+    local staffSet = {}      -- [name] = true -> has a staff tag
+    local staffChecked = {}  -- [name] = true -> Passes already read for this player
+    local staffPending = {}  -- [name] = tries -> waiting for their Passes to exist
+    local godSet = {}        -- [name] = true -> GodMode is on right now
+    local godSeen = {}       -- [name] = last GodMode state read (true / false), nil = never read
+    local godGV = {}         -- [name] = cached Status.GameplayVariables instance
+    local staffDirty = true
+    local staffWasOn = false
+
+    local slView = Workspace.CurrentCamera.ViewportSize
+    local slPanel = newPanel("staff", SL_X, slView.Y - SL_MARGIN, SL_W, 28, true)
+    local slRows, slRowText, slRowGod = {}, {}, {}
+    local slBg, slDot, slTitle, slSep, slCount
+    local slCountText = ""
+    local slVisible = false
+
+    slOK = pcall(function()
+        slBg = addItem(slPanel, "Square", {
+            Filled = true, Color = Color3.fromRGB(22, 22, 28),
+            Size = Vector2.new(SL_W, 28), ZIndex = 1, Visible = false,
+        }, 0, 0, true)
+        pcall(function() slBg.Corner = 8 end)
+
+        slDot = addItem(slPanel, "Square", {
+            Filled = true, Color = Color3.fromRGB(130, 110, 255),
+            Size = Vector2.new(6, 6), ZIndex = 2, Visible = false,
+        }, 12, 12)
+        slTitle = addItem(slPanel, "Text", {
+            Text = "Scanning for staff", Color = Color3.fromRGB(255, 255, 255),
+            Font = Drawing.Fonts.SystemBold, Size = 12,
+            ZIndex = 2, Visible = false,
+        }, 24, 8)
+        slCount = addItem(slPanel, "Text", {
+            Text = "", Color = Color3.fromRGB(255, 90, 90),
+            Font = Drawing.Fonts.SystemBold, Size = 13,
+            ZIndex = 2, Visible = false,
+        }, 12, 30)
+        slSep = addItem(slPanel, "Square", {
+            Filled = true, Color = Color3.fromRGB(80, 80, 92),
+            Size = Vector2.new(SL_W - 24, 1), ZIndex = 2, Visible = false,
+        }, 12, 50)
+        for i = 1, SL_MAX_ROWS do
+            slRows[i] = addItem(slPanel, "Text", {
+                Text = "", Color = Color3.fromRGB(190, 190, 200),
+                Font = Drawing.Fonts.System, Size = 13,
+                ZIndex = 2, Visible = false,
+            }, 12, 58 + (i - 1) * SL_ROW_H)
+        end
+    end)
+
+    if not slOK then
+        destroyPanel(slPanel)
+        slRows = {}
+    end
+
+    -- Panel height follows the number of names; positions are only rewritten when the list changes.
+    local function layoutStaffPanel(n, total)
+        -- title row, then (only when staff is detected) "Staff Detected (x)", separator and names
+        local H = (n > 0) and (58 + n * SL_ROW_H + 6) or 28
+        slPanel.h = H
+        slBg.Size = Vector2.new(SL_W, H)
+
+        if n > 0 then
+            local text = "Staff Detected (" .. total .. ")"
+            if text ~= slCountText then
+                slCountText = text
+                slCount.Text = text
+            end
+        end
+        slCount.Visible = n > 0
+        slSep.Visible = n > 0
+
+        for i = 1, SL_MAX_ROWS do
+            slRows[i].Visible = (i <= n)
+        end
+
+        placePanel(slPanel) -- bottom edge stays put, so the panel grows upward
+    end
+
+    local function renderStaffPanel()
+        -- everyone with a staff tag OR GodMode on (a god-moded player may have no tag)
+        local names = {}
+        for name in pairs(staffSet) do
+            names[#names + 1] = name
+        end
+        for name in pairs(godSet) do
+            if not staffSet[name] then names[#names + 1] = name end
+        end
+        table.sort(names)
+
+        local total = #names
+        local n = (total < SL_MAX_ROWS) and total or SL_MAX_ROWS
+        for i = 1, n do
+            local nm = names[i]
+            local god = godSet[nm] == true
+            local text = god and (nm .. " - God Mode") or nm
+            if total > SL_MAX_ROWS and i == SL_MAX_ROWS then
+                text = "+" .. (total - SL_MAX_ROWS + 1) .. " more"
+                god = false
+            end
+            if slRowText[i] ~= text then
+                slRowText[i] = text
+                slRows[i].Text = text
+            end
+            if slRowGod[i] ~= god then
+                slRowGod[i] = god
+                slRows[i].Color = god and GOD_COLOR or Color3.fromRGB(190, 190, 200)
+            end
+        end
+        layoutStaffPanel(n, total)
+    end
+
+    local function setStaffPanelVisible(v)
+        if v == slVisible then return end
+        slVisible = v
+        slPanel.shown = v
+        slBg.Visible = v
+        slDot.Visible = v
+        slTitle.Visible = v
+        if not v then
+            slCount.Visible = false
+            slSep.Visible = false
+            for i = 1, SL_MAX_ROWS do slRows[i].Visible = false end
+        else
+            staffDirty = true -- redraw rows when the panel is shown again
+        end
+    end
+
+    -- Decides which label a player gets: GodMode wins over the Early Access tag.
+    -- (You never get a label over yourself.)
+    local function refreshLabel(name)
+        if name == LOCAL_NAME then return end
+        if godSet[name] then
+            modTargets[name] = "god"
+        elseif staffSet[name] then
+            modTargets[name] = true
+        else
+            modTargets[name] = nil
+        end
+    end
+
+    -- Reads GodMode for one player (called once a second from syncStaff).
+    -- ReplicatedStorage.Players.<name>.Status.GameplayVariables is cached per player
+    -- and only looked up again when it is missing / was replaced.
+    local function checkGod(name)
+        local gv = godGV[name]
+        if not gv or gv.Parent == nil then
+            local folder = getPlayersFolder()
+            local n = folder and folder:FindFirstChild(name)
+            n = n and n:FindFirstChild("Status")
+            gv = n and n:FindFirstChild("GameplayVariables")
+            godGV[name] = gv -- nil = not loaded yet, tried again next scan
+        end
+
+        local on = (gv ~= nil) and readFlag(gv, "GodMode")
+        local was = godSeen[name]
+        godSeen[name] = on
+        local isMe = (name == LOCAL_NAME)
+
+        if on then
+            if not isMe or STAFF_LIST_INCLUDE_SELF then
+                if not godSet[name] then
+                    godSet[name] = true
+                    staffDirty = true
+                    refreshLabel(name)
+                end
+            end
+            -- red box when GodMode turns on (or when it is already on the first time we see the player)
+            if not isMe and was ~= true then
+                Notification.push("God Mode Detector", name .. " is God Moded", STAFF_NOTIFY)
+            end
+        elseif godSet[name] then
+            godSet[name] = nil
+            staffDirty = true
+            refreshLabel(name)
+        end
+    end
+
+    -- Reads Passes for players that are still waiting for them
+    local function processStaffPending()
+        if next(staffPending) == nil then return end
+        local folder = getPlayersFolder()
+        if not folder then return end
+
+        for name, tries in pairs(staffPending) do
+            local plrFolder = folder:FindFirstChild(name)
+            local passes = plrFolder and getPasses(folder, name)
+            local isMe = (name == LOCAL_NAME)
+
+            if plrFolder and isEarlyAccess(plrFolder, passes) then
+                staffPending[name] = nil
+                staffChecked[name] = true
+                if not isMe or STAFF_LIST_INCLUDE_SELF then
+                    staffSet[name] = true
+                    staffDirty = true
+                    if not isMe then
+                        refreshLabel(name) -- [POSSIBLE MOD] label (or "God Moded" if GodMode is on)
+                        Notification.push("Staff Detector", name .. " has " .. STAFF_LABEL, STAFF_NOTIFY)
+                    end
+                end
+            elseif passes then
+                -- player folder and Passes both loaded and neither flag is on: not staff
+                staffPending[name] = nil
+                staffChecked[name] = true
+            elseif tries >= SL_MAX_TRIES then
+                staffPending[name] = nil
+                staffChecked[name] = true -- gave up; checked again the next time they join
+            else
+                staffPending[name] = tries + 1
+            end
+        end
+    end
+
+    -- Scans game.Players: queues players we have not checked yet, reads GodMode for
+    -- everyone, drops ones that are gone
+    local function syncStaff()
+        local present = {}
+        for _, plr in ipairs(Players:GetPlayers()) do
+            local name = plr.Name
+            present[name] = true
+            if not staffChecked[name] and staffPending[name] == nil then
+                staffPending[name] = 0
+            end
+            checkGod(name)
+        end
+
+        for name in pairs(staffChecked) do
+            if not present[name] then
+                staffChecked[name] = nil
+                if staffSet[name] then
+                    staffSet[name] = nil
+                    staffDirty = true
+                end
+                modTargets[name] = nil
+            end
+        end
+        for name in pairs(staffPending) do
+            if not present[name] then staffPending[name] = nil end
+        end
+        for name in pairs(godSeen) do
+            if not present[name] then
+                godSeen[name] = nil
+                godGV[name] = nil
+                if godSet[name] then
+                    godSet[name] = nil
+                    staffDirty = true
+                end
+                modTargets[name] = nil
+            end
+        end
+
+        processStaffPending()
+    end
+
+    -- Worker (once a second while the list is on): picks up joins/leaves, retries
+    -- pending players, and redraws only when something changed
+    local function staffStep()
+        local on = slOK and UI.GetValue("opt_stafflist")
+        if on then
+            syncStaff()
+            setStaffPanelVisible(true)
+            if staffDirty then
+                staffDirty = false
+                renderStaffPanel()
+            end
+        else
+            if staffWasOn then
+                -- turned off: reset everything so a fresh scan runs when it is turned back on
+                staffSet, staffChecked, staffPending, modTargets = {}, {}, {}, {}
+                godSet, godSeen, godGV = {}, {}, {}
+            end
+            setStaffPanelVisible(false)
+        end
+        staffWasOn = on and true or false
+    end
+
+    task.spawn(function()
+        while true do
+            guarded(staffStep)
+            wait(1)
+        end
+    end)
+end
+
+-- (own scope: Server Loot panel; shares lootOK)
+local lootOK
+do
+    ----------------------------------------------------------------------
+    -- SERVER LOOT SCANNER PANEL (right side by default)
+    -- Every LOOT_REFRESH seconds: takes the players still in game.Players, keeps the
+    -- ones that also exist in ReplicatedStorage.Players, and counts every item from
+    -- LOOT_ITEMS anywhere inside their Inventory (also when it sits inside clothing,
+    -- bags or other items). Only players that have at least one of the items are
+    -- listed:
+    --   PlayerName
+    --     R700
+    --     338AP (32x)
+    -- "(Nx)" is only written when a player has more than one of that item.
+    -- Each inventory object with a matching name counts as one.
+    ----------------------------------------------------------------------
+    local LOOT_W = 200
+    local LOOT_ROW_H = 14
+    local LOOT_ROW_Y = 28
+
+    local LOOT_SET = {} -- [itemName] = position in LOOT_ITEMS
+    for i = 1, #LOOT_ITEMS do
+        LOOT_SET[LOOT_ITEMS[i]] = i
+    end
+
+    local lootView = Workspace.CurrentCamera.ViewportSize
+    local lootPanel = newPanel("loot", math.floor(lootView.X - LOOT_W - 20), 20, LOOT_W, 36)
+    local lootStatic = {}       -- bg, dot, title
+    local lootRows = {}         -- pooled text rows
+    local lootRowText, lootRowKind = {}, {}
+    local lootRowCount = 0
+    local lootVisible = false
+    local lootBg, lootTitle
+    local lootTitleText = ""
+    local lootLastScan = 0
+
+    local LOOT_WHITE = Color3.fromRGB(255, 255, 255)
+    local LOOT_GRAY = Color3.fromRGB(190, 190, 200)
+
+    lootOK = pcall(function()
+        lootBg = addItem(lootPanel, "Square", {
+            Filled = true, Color = Color3.fromRGB(22, 22, 28),
+            Size = Vector2.new(LOOT_W, 36), ZIndex = 1, Visible = false,
+        }, 0, 0, true)
+        pcall(function() lootBg.Corner = 8 end)
+        lootStatic[1] = lootBg
+
+        lootStatic[2] = addItem(lootPanel, "Square", {
+            Filled = true, Color = Color3.fromRGB(130, 110, 255),
+            Size = Vector2.new(6, 6), ZIndex = 2, Visible = false,
+        }, 12, 12)
+        lootTitle = addItem(lootPanel, "Text", {
+            Text = "Server Loot", Color = LOOT_WHITE,
+            Font = Drawing.Fonts.SystemBold, Size = 12,
+            ZIndex = 2, Visible = false,
+        }, 24, 8)
+        lootStatic[3] = lootTitle
+
+        for i = 1, LOOT_MAX_ROWS do
+            lootRows[i] = addItem(lootPanel, "Text", {
+                Text = "", Color = LOOT_GRAY,
+                Font = Drawing.Fonts.System, Size = 12,
+                ZIndex = 2, Visible = false,
+            }, 12, LOOT_ROW_Y + (i - 1) * LOOT_ROW_H)
+            lootRowKind[i] = 2 -- 1 = player name row, 2 = item row
+        end
+    end)
+
+    if not lootOK then
+        destroyPanel(lootPanel)
+        lootStatic, lootRows = {}, {}
+    end
+
+    local function showLoot(visible)
+        if visible == lootVisible then return end
+        for i = 1, #lootStatic do
+            lootStatic[i].Visible = visible
+        end
+        for i = 1, lootRowCount do
+            lootRows[i].Visible = visible
+        end
+        lootVisible = visible
+        lootPanel.shown = visible
+    end
+
+    -- Names of players that are still in the server AND exist in ReplicatedStorage.Players
+    local function lootGetNames(out)
+        local folder = getPlayersFolder()
+        if not folder then return end
+        for _, plr in ipairs(Players:GetPlayers()) do
+            local name = plr.Name
+            if (LOOT_INCLUDE_SELF or name ~= LOCAL_NAME) and folder:FindFirstChild(name) then
+                out[#out + 1] = name
+            end
+        end
+        table.sort(out)
+    end
+
+    -- Counts the LOOT_ITEMS inside one player's Inventory. Returns nil if they have none.
+    -- counts[i] = amount of LOOT_ITEMS[i]
+    local function lootScanPlayer(name)
+        local folder = getPlayersFolder()
+        local plr = folder and folder:FindFirstChild(name)
+        local inv = plr and plr:FindFirstChild("Inventory")
+        if not inv then return nil end
+
+        local desc = inv:GetDescendants()
+        local limit = #desc
+        if limit > LOOT_MAX_NODES then limit = LOOT_MAX_NODES end
+
+        local counts = {}
+        local found = false
+        for i = 1, limit do
+            local idx = LOOT_SET[desc[i].Name]
+            if idx then
+                counts[idx] = (counts[idx] or 0) + 1
+                found = true
+            end
+        end
+        if found then return counts end
+        return nil
+    end
+
+    -- results[i] = { name = playerName, counts = { [itemIndex] = amount } }
+    local function renderLoot(results)
+        local texts, kinds = {}, {}
+        for i = 1, #results do
+            local r = results[i]
+            texts[#texts + 1] = r.name
+            kinds[#kinds + 1] = 1
+            for idx = 1, #LOOT_ITEMS do
+                local c = r.counts[idx]
+                if c then
+                    if c > 1 then
+                        texts[#texts + 1] = "  " .. LOOT_ITEMS[idx] .. " (" .. c .. "x)"
+                    else
+                        texts[#texts + 1] = "  " .. LOOT_ITEMS[idx]
+                    end
+                    kinds[#kinds + 1] = HIGHLIGHT[LOOT_ITEMS[idx]] and 3 or 2 -- 3 = highlighted item
+                end
+            end
+        end
+        if #texts == 0 then
+            texts[1] = "No loot found"
+            kinds[1] = 2
+        end
+
+        -- keep within the pooled rows
+        if #texts > LOOT_MAX_ROWS then
+            local extra = #texts - (LOOT_MAX_ROWS - 1)
+            for i = #texts, LOOT_MAX_ROWS, -1 do
+                texts[i] = nil
+                kinds[i] = nil
+            end
+            texts[LOOT_MAX_ROWS] = "... +" .. extra .. " more"
+            kinds[LOOT_MAX_ROWS] = 2
+        end
+
+        -- only write what changed
+        local n = #texts
+        for i = 1, n do
+            if lootRowText[i] ~= texts[i] then
+                lootRowText[i] = texts[i]
+                lootRows[i].Text = texts[i]
+            end
+            if lootRowKind[i] ~= kinds[i] then
+                lootRowKind[i] = kinds[i]
+                if kinds[i] == 1 then
+                    lootRows[i].Font = Drawing.Fonts.SystemBold
+                    lootRows[i].Color = LOOT_WHITE
+                elseif kinds[i] == 3 then
+                    lootRows[i].Font = Drawing.Fonts.SystemBold
+                    lootRows[i].Color = HIGHLIGHT_COLOR
+                else
+                    lootRows[i].Font = Drawing.Fonts.System
+                    lootRows[i].Color = LOOT_GRAY
+                end
+            end
+        end
+
+        if n ~= lootRowCount then
+            if lootVisible then
+                for i = n + 1, lootRowCount do lootRows[i].Visible = false end
+                for i = lootRowCount + 1, n do lootRows[i].Visible = true end
+            end
+            lootRowCount = n
+            lootPanel.h = LOOT_ROW_Y + n * LOOT_ROW_H + 8
+            lootBg.Size = Vector2.new(LOOT_W, lootPanel.h)
+        end
+
+        local title = "Server Loot (" .. #results .. ")"
+        if title ~= lootTitleText then
+            lootTitleText = title
+            lootTitle.Text = title
+        end
+    end
+
+    -- The scan yields between players (so a big server never freezes a frame); those
+    -- yields happen outside pcall on purpose.
+    task.spawn(function()
+        while true do
+            local on = lootOK and UI.GetValue("opt_four")
+            if on then
+                showLoot(true)
+                local now = tick()
+                if now - lootLastScan >= LOOT_REFRESH then
+                    lootLastScan = now
+
+                    local names = {}
+                    if not pcall(lootGetNames, names) then loadErrors = loadErrors + 1 end
+
+                    local results = {}
+                    for i = 1, #names do
+                        local ok, counts = pcall(lootScanPlayer, names[i])
+                        if not ok then
+                            loadErrors = loadErrors + 1
+                        elseif counts then
+                            results[#results + 1] = { name = names[i], counts = counts }
+                        end
+                        task.wait()
+                    end
+
+                    if UI.GetValue("opt_four") then -- still on after the scan?
+                        guarded(function() renderLoot(results) end)
+                    end
+                end
+            else
+                showLoot(false)
+                lootLastScan = 0 -- scan right away when it is switched back on
+            end
+            wait(0.5)
+        end
+    end)
+end
+
+-- (own scope: Boss Tracker panel; shares bossOK)
+local bossOK
+do
+    ----------------------------------------------------------------------
+    -- BOSS TRACKER PANEL (left of Server Loot by default)
+    -- One row per boss in BOSS_NAMES (listed vertically):
+    --   available    -> green, bold:   ! BTR !
+    --   unavailable  -> darker grey:   BTR
+    -- When a boss changes state a notification box pops up (bottom right). The first
+    -- scan after switching the toggle on only sets the starting state (no popups).
+    -- Controlled by the "Boss Tracker" toggle in the Server Toggles section.
+    --
+    -- HOW "AVAILABLE" IS DETECTED (best guess - adjust if your game differs):
+    --   a boss counts as available while an object with its name exists directly in
+    --   Workspace (or directly inside one of the Workspace folders listed in
+    --   BOSS_FOLDERS). Names are compared ignoring case, spaces and dashes, so
+    --   "MI-24" also matches "MI24". Only that one list is read, every BOSS_REFRESH
+    --   seconds, and only while the toggle is on.
+    ----------------------------------------------------------------------
+    local BOSS_NAMES = { "Whisper", "Death", "Dozer", "Anton", "BTR", "MI-24" }
+    local BOSS_FOLDERS = {}     -- extra Workspace folder names to look in, e.g. { "Bosses", "NPCs" }
+    local BOSS_REFRESH = 3      -- seconds between scans
+
+    local BOSS_W, BOSS_GAP = 200, 10   -- BOSS_GAP = px between this panel and Server Loot
+    local BOSS_ROW_Y, BOSS_ROW_H = 36, 16
+    local BOSS_H = BOSS_ROW_Y + #BOSS_NAMES * BOSS_ROW_H + 6
+
+    local BOSS_UP_COLOR = Color3.fromRGB(70, 220, 110)
+    local BOSS_DOWN_COLOR = Color3.fromRGB(125, 125, 138) -- slightly darker than the normal panel grey
+    local BOSS_UP_NOTIFY = { seconds = 15, color = BOSS_UP_COLOR }
+    local BOSS_DOWN_NOTIFY = { seconds = 10, color = BOSS_DOWN_COLOR }
+
+    -- lowercase, letters and digits only
+    local function norm(s)
+        return string.lower((string.gsub(s, "[^%w]", "")))
+    end
+
+    local BOSS_KEY = {} -- [normalized name] = index in BOSS_NAMES
+    for i = 1, #BOSS_NAMES do
+        BOSS_KEY[norm(BOSS_NAMES[i])] = i
+    end
+
+    local bossView = Workspace.CurrentCamera.ViewportSize
+    -- Server Loot sits at (view.X - 200 - 20); this goes one panel width + gap further left
+    local bossPanel = newPanel("boss", math.floor(bossView.X - 200 - 20 - BOSS_GAP - BOSS_W), 20, BOSS_W, BOSS_H)
+    local bossRows = {}
+    local bossVisible = false
+
+    bossOK = pcall(function()
+        local bg = addItem(bossPanel, "Square", {
+            Filled = true, Color = Color3.fromRGB(22, 22, 28),
+            Size = Vector2.new(BOSS_W, BOSS_H), ZIndex = 1, Visible = false,
+        }, 0, 0, true)
+        pcall(function() bg.Corner = 8 end)
+
+        addItem(bossPanel, "Square", { -- purple dot next to the title
+            Filled = true, Color = Color3.fromRGB(130, 110, 255),
+            Size = Vector2.new(6, 6), ZIndex = 2, Visible = false,
+        }, 12, 12)
+        addItem(bossPanel, "Text", {
+            Text = "Boss Tracker", Color = Color3.fromRGB(255, 255, 255),
+            Font = Drawing.Fonts.SystemBold, Size = 12,
+            ZIndex = 2, Visible = false,
+        }, 24, 8)
+        addItem(bossPanel, "Square", { -- separator line
+            Filled = true, Color = Color3.fromRGB(80, 80, 92),
+            Size = Vector2.new(BOSS_W - 24, 1), ZIndex = 2, Visible = false,
+        }, 12, 27)
+
+        for i = 1, #BOSS_NAMES do
+            bossRows[i] = addItem(bossPanel, "Text", {
+                Text = BOSS_NAMES[i], Color = BOSS_DOWN_COLOR,
+                Font = Drawing.Fonts.System, Size = 13,
+                ZIndex = 2, Visible = false,
+            }, 12, BOSS_ROW_Y + (i - 1) * BOSS_ROW_H)
+        end
+    end)
+
+    if not bossOK then
+        destroyPanel(bossPanel)
+        bossRows = {}
+    end
+
+    local found = {}   -- [index] = true while that boss exists (reused every scan)
+    local bossUp = {}  -- [index] = last known state (nil = not scanned yet)
+
+    -- Marks every boss that has a direct child of `parent` with its name
+    local function scanParent(parent)
+        local kids = parent:GetChildren()
+        for i = 1, #kids do
+            local idx = BOSS_KEY[norm(kids[i].Name)]
+            if idx then found[idx] = true end
+        end
+    end
+
+    local function scanBosses()
+        for i = 1, #BOSS_NAMES do found[i] = false end
+        scanParent(Workspace)
+        for i = 1, #BOSS_FOLDERS do
+            local f = Workspace:FindFirstChild(BOSS_FOLDERS[i])
+            if f then scanParent(f) end
+        end
+    end
+
+    -- Only called when a boss changes state
+    local function applyRow(i, up)
+        local r = bossRows[i]
+        if up then
+            r.Text = "! " .. BOSS_NAMES[i] .. " !"
+            r.Color = BOSS_UP_COLOR
+            r.Font = Drawing.Fonts.SystemBold
+        else
+            r.Text = BOSS_NAMES[i]
+            r.Color = BOSS_DOWN_COLOR
+            r.Font = Drawing.Fonts.System
+        end
+    end
+
+    local lastScan, hadBaseline = 0, false
+
+    local function bossStep()
+        if not bossOK then return end
+        local on = UI.GetValue("opt_boss") == true
+
+        if on ~= bossVisible then
+            bossVisible = on
+            setPanelItemsVisible(bossPanel, on)
+        end
+
+        if not on then
+            if hadBaseline then
+                -- switched off: forget the state so the next scan starts fresh (no popups)
+                hadBaseline = false
+                lastScan = 0
+                for i = 1, #BOSS_NAMES do bossUp[i] = nil end
+            end
+            return
+        end
+
+        local now = tick()
+        if now - lastScan < BOSS_REFRESH then return end
+        lastScan = now
+        hadBaseline = true
+
+        scanBosses()
+        for i = 1, #BOSS_NAMES do
+            local up = found[i]
+            local prev = bossUp[i]
+            if prev ~= up then
+                bossUp[i] = up
+                applyRow(i, up)
+                if prev ~= nil then -- a real change, not the first scan
+                    if up then
+                        Notification.push("Boss Tracker", BOSS_NAMES[i] .. " is now available", BOSS_UP_NOTIFY)
+                    else
+                        Notification.push("Boss Tracker", BOSS_NAMES[i] .. " is no longer available", BOSS_DOWN_NOTIFY)
+                    end
+                end
+            end
+        end
+    end
+
+    task.spawn(function()
+        while true do
+            guarded(bossStep)
+            wait(0.5)
+        end
+    end)
+end
+
+----------------------------------------------------------------------
+-- UI OPACITY (slider in the Interface section; applied only when it changes)
+-- Also feeds the Performance Mode toggle into Notification.perf (checked here
+-- every 0.2s so no extra loop is needed; the Hotbar fade and the notification
+-- slide both read that flag).
+----------------------------------------------------------------------
+local function opacityStep()
+    Notification.perf = UI.GetValue("opt_perf") == true
+    local v = UI.GetValue("ui_opacity")
+    if type(v) == "number" and v ~= uiOpacity then
+        uiOpacity = v
+        applyOpacity()
+    end
+end
+
+task.spawn(function()
+    while true do
+        guarded(opacityStep)
+        wait(0.2)
+    end
+end)
+
+----------------------------------------------------------------------
+-- DRAGGING
+-- Hold the left mouse button on a panel's top bar (DRAG_HEADER_H px) and move.
+-- Panels are clamped to the screen. Positions reset on re-execute (or with the
+-- "Reset UI Positions" button).
+----------------------------------------------------------------------
+local dragMouse = Players.LocalPlayer:GetMouse()
+local dragPanel, dragOX, dragOY = nil, 0, 0
+local dragWasDown = false
+
+local function dragStep()
+    if not ismouse1pressed() then
+        dragPanel = nil
+        dragWasDown = false
+        return
+    end
+
+    local mx, my = dragMouse.X, dragMouse.Y + MOUSE_Y_OFFSET
+
+    -- grab: only on the frame the button goes down, topmost (last created) panel first
+    if not dragWasDown and isrbxactive() then
+        for i = #panels, 1, -1 do
+            local p = panels[i]
+            if p.shown then
+                local top = panelTop(p)
+                local hx0 = p.x + (p.hx or 0)           -- hotbar: only the name pill grabs
+                local hx1 = hx0 + (p.hw or p.w)
+                if mx >= hx0 and mx <= hx1 and my >= top and my <= top + DRAG_HEADER_H then
+                    dragPanel = p
+                    dragOX = mx - p.x
+                    dragOY = my - top
+                    break
+                end
+            end
+        end
+    end
+    dragWasDown = true
+
+    local p = dragPanel
+    if p then
+        local view = Workspace.CurrentCamera.ViewportSize
+        local nx = clamp(mx - dragOX, 0, view.X - p.w)
+        local ntop = clamp(my - dragOY, 0, view.Y - p.h)
+        local ny = p.bottom and (ntop + p.h) or ntop
+        if nx ~= p.x or ny ~= p.y then
+            p.x, p.y = nx, ny
+            placePanel(p)
+        end
+    end
+end
+
+RunService.RenderStepped:Connect(function()
+    guarded(dragStep)
+end)
+
+----------------------------------------------------------------------
+-- LOAD CHECK
+-- The one and only console line. It waits 2 seconds so every background loop
+-- has run at least once, then prints only if all panels were created, the
+-- game data folder was found, and no error was caught anywhere.
+----------------------------------------------------------------------
+task.spawn(function()
+    wait(2)
+    local allGood = panelOK and invOK and hbOK and slOK and lootOK and bossOK
+        and not labelsBroken
+        and getPlayersFolder() ~= nil
+        and loadErrors == 0
+    if allGood then
+        print("FuzzyHook - PRIVATE has loaded without any errors")
+    end
+end)
