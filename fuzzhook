@@ -68,11 +68,7 @@ local DRAG_HEADER_H = 24       -- px: top strip of each panel that grabs the mou
 local MOUSE_Y_OFFSET = 0       -- if panels jump ~36px when you grab them, set this to -36 (or 36)
 
 -- Hotbar panel
-local HOTBAR_REFRESH = 0.5     -- seconds between hotbar re-reads
--- (HOTBAR_SLOTS / HOTBAR_KEYS are not used by the equipment hotbar; they are kept for the
---  upcoming weapons / hotbar-slot step)
-local HOTBAR_SLOTS = { "ItemBack1", "ItemBack2", "Hotbar4", "Hotbar5", "Hotbar6", "Hotbar7", "Hotbar8" }
-local HOTBAR_KEYS  = { "B1", "B2", "4", "5", "6", "7", "8" } -- little label in each slot's corner
+-- (Lua allows only 200 local variables at once in this main chunk, so unused ones were removed)
 local HOTBAR_MODES = { "Looked at player", "Myself" }        -- "Hotbar Target" dropdown
 
 -- Hotbar team row ("View Player Teams")
@@ -131,24 +127,38 @@ MP5
 VZ61
 TOZ87
 NagantRevolver
+IZH12
+IZH87
+MP5SD
+PPSH41
+RPG7
 
 ! grenades !
 F1
 RGO
 RGD5
 M84
+F1Tripwire
+MON50
+PMN2
 
 ! Meds !
 AI2
 AI4
 AA2
 IFAK
+Bandage
+Dressing
+Rags
+Defibrillator
 
 ! Misc !
 DAGR
 Pathfinder
 Map
 Lighter
+Barricade
+Sandbags
 
 ! Valuable !
 SPSh44
@@ -230,6 +240,24 @@ ZSh
 ZShVisor
 Kulon
 6B5
+6B2
+6B23
+6B45
+AltynVisor
+Dozer
+GMT
+IOLA
+MikeShades
+MotorcycleHelmet
+ScavKingCrown
+SSH68
+TWS
+TankerCap
+ConcealedVest
+Smersh
+Bandolier
+GP5
+GP7
 
 ! BAGS !
 Attak5
@@ -237,6 +265,7 @@ Lynx
 WastelandBackpack
 Tortilla
 SpecopsBackpack
+Wastelander
 
 ! Keychain !
 Keychain
@@ -245,6 +274,9 @@ Keychain
 OrangeCard
 RedCard
 BlueCard
+BlueKeycard
+OrangeKeycard
+RedKeycard
 ]]
 
 -- Parsed once at load:
@@ -287,25 +319,6 @@ do
         end
     end
 end
-
--- Slot colors (keyed by the category names above; kept for the upcoming weapons step)
-local CATEGORY_COLORS = {
-    ["Weapons"]        = Color3.fromRGB(150, 56, 56),
-    ["Grenades"]       = Color3.fromRGB(168, 96, 42),
-    ["Meds"]           = Color3.fromRGB(52, 134, 84),
-    ["Misc"]           = Color3.fromRGB(100, 100, 120),
-    ["Valuable"]       = Color3.fromRGB(168, 138, 44),
-    ["Super Valuable"] = Color3.fromRGB(170, 90, 148),
-    ["Stims"]          = Color3.fromRGB(62, 126, 174),
-    ["Food"]           = Color3.fromRGB(110, 148, 66),
-    ["Repair Kits"]    = Color3.fromRGB(88, 110, 128),
-    ["Armor"]          = Color3.fromRGB(74, 88, 156),
-    ["Bags"]           = Color3.fromRGB(122, 88, 58),
-    ["Keychain"]       = Color3.fromRGB(150, 130, 90),
-    ["Keycards"]       = Color3.fromRGB(190, 80, 60),
-}
-local DEFAULT_TILE_COLOR = Color3.fromRGB(56, 56, 68)
-local EMPTY_TILE_COLOR = Color3.fromRGB(38, 38, 46)
 
 -- Highlighted items: shown in HIGHLIGHT_COLOR (deep pink) in the Server Loot panel and in
 -- Inv Aim (and as a pink-tinted tile in the Hotbar). Add or remove EXACT item names in
@@ -559,6 +572,7 @@ local INVENTORY_TOGGLES = {
     { id = "opt_three",  label = "Inventory Scanner", default = true, cb = printToggle("Inventory Scanner") },
     { id = "opt_inv",    label = "Inv Aim",           default = true, cb = printToggle("Inv Aim") },
     { id = "opt_hotbar", label = "Hotbar",            default = true, cb = printToggle("Hotbar") },
+    { id = "opt_attico", label = "Attachment Icons",  default = true, cb = printToggle("Attachment Icons") },
 }
 
 -- One "Filter <category>" toggle per category (built once)
@@ -698,6 +712,8 @@ end
 -- origin, so moving a panel = rewriting each drawing's Position once.
 --   * bg drawings use the UI Opacity value, text uses it + 0.1
 --   * panel.bottom = true means panel.y is the BOTTOM edge (panel grows upward)
+--   * panel.fade (optional, 0..1) multiplies every drawing's opacity; only the
+--     Hotbar sets it (fade in / out)
 -- NOTE: Drawing.Transparency is assumed to be 1 = solid, 0 = invisible
 -- (Roblox convention). If the slider behaves backwards, change bgAlpha() and
 -- fgAlpha() above to return 1 - value.
@@ -767,10 +783,12 @@ local function applyOpacity()
     Notification.refreshOpacity()
     local bgA, fgA = bgAlpha(), fgAlpha()
     for i = 1, #panels do
-        local items = panels[i].items
+        local p = panels[i]
+        local f = p.fade or 1 -- only the hotbar sets this (fade multiplier)
+        local items = p.items
         for j = 1, #items do
             local it = items[j]
-            it.d.Transparency = it.bg and bgA or fgA
+            it.d.Transparency = (it.bg and bgA or fgA) * f
         end
     end
 end
@@ -1277,25 +1295,31 @@ end
 local hbOK, hotbarStep
 do
     ----------------------------------------------------------------------
-    -- EQUIPMENT HOTBAR (name pill on top, then big rounded icon tiles, then the team
-    -- card as the very last block; same dark / purple colors as the other panels)
-    -- Looks through EVERYTHING inside
+    -- EQUIPMENT HOTBAR (name pill on top, then the hotbar items row (only when a slot is
+    -- filled), then the equipment tiles, then the team card as the very last block; same
+    -- dark / purple colors as the other panels. The tile holding the player's EquippedTool
+    -- gets a brighter purple outline.)
+    -- Equipment: every name in ARMOR_ORDER is looked up DIRECTLY under
     --   ReplicatedStorage.Players.<name>.Inventory
-    -- (also items nested inside clothing / bags) and shows every object whose name
-    -- is in ARMOR_ORDER. Each name is shown once.
+    -- (no scan of every descendant). Each name is shown once.
+    -- Attachment rules (read from <item>.Attachments):
+    --   * FastMT with QuadNVG AND TitanShield is shown as a GMT (icon GMT.png)
+    --   * Altyn with MaskaVisor / AltynVisor shows that visor as a small icon in the
+    --     bottom-right corner of the Altyn tile (the Altyn stays the main icon)
     -- Icons: downloaded once per item from the GitHub repo (jsDelivr first, raw
     -- GitHub as fallback, see IMG_BASES) and cached. While an icon is missing /
     -- loading, the tile shows the item name.
     -- The files must be REAL images (PNG / JPEG). WebP files renamed to .png are
     -- rejected (see imgKind / ALLOW_WEBP below).
     -- Failed downloads are retried every IMG_RETRY seconds.
+    -- FADE: the whole panel fades in when it goes onto a player and fades out when it
+    -- goes off (see FADE_IN_TIME / FADE_OUT_TIME). The fade only runs while it is
+    -- animating; idle or hidden it costs one comparison per frame.
     -- "Hotbar Debug (prints)" (Debug Options) prints what the hotbar sees for the shown
     -- player and why an icon is not loading.
     ----------------------------------------------------------------------
-    local EQUIP_NESTED = true       -- true = search everything inside Inventory, false = direct children only
-    local EQUIP_MAX_NODES = 1500    -- safety cap on objects looked at per scan
+    local EQUIP_MAX_NODES = 1500    -- safety cap on objects looked at per debug scan
     local EQUIP_REFRESH = 1.5       -- seconds between re-reads of the targeted player
-    local IMG_BASE = "https://raw.githubusercontent.com/123123123332221111/-x-Lp-6L-0-S-x-m-Z-2ZCi-Z/main/"
     -- Hosts tried in order for every icon (jsDelivr caches @main for a while: after
     -- pushing new images, put the raw GitHub URL first or use a commit hash / tag).
     local IMG_BASES = {
@@ -1305,17 +1329,26 @@ do
     local IMG_RETRY = 60
 
     local PAD = 12
-    local TILE, GAP, IMG_PAD = 56, 8, 4   -- bigger tiles so the icons are easy to see
+    local TILE, GAP, IMG_PAD = 64, 8, 4   -- bigger tiles so the icons are easy to see
     local PILL_H, PILL_GAP = 24, 8        -- name pill on top, space under it
     local SECTION_GAP = 8                 -- space between the stacked blocks
+    local TITLE_NUDGE_X = 2               -- name in the pill: + moves it right, - moves it left (px)
     local CARD_PAD = 10                   -- padding inside the message / team cards
     local MIN_W = 210                     -- only used for the very first position
     local MAX_TILES = 10
+    local MAX_HOT = 7                    -- hotbar row: ItemBack1, ItemBack2, Hotbar4 .. Hotbar8
+    local HOT_REFRESH = 0.3              -- seconds between hotbar / equipped-tool re-reads (cheap, so fast)
+    -- slot names inside ReplicatedStorage.Players.<name>.Status.GameplayVariables.Hotbar
+    -- (capitalisation is ignored; an empty slot is simply not shown)
+    -- (the game also has "ItemHip1" = sidearm and "Melee" = knife slots; add them to this list to show them too.
+    --  MAX_HOT above must be at least the number of names in the list.)
+    local HOT_SLOTS = { "ItemBack1", "ItemBack2", "Hotbar4", "Hotbar5", "Hotbar6", "Hotbar7", "Hotbar8" }
 
     local BG_COLOR = Color3.fromRGB(22, 22, 28)
-    local PURPLE = Color3.fromRGB(130, 110, 255)
     local TILE_BG = Color3.fromRGB(30, 34, 48)   -- slightly blue, like the reference
     local STROKE_COLOR = Color3.fromRGB(64, 72, 96) -- outline around each icon box
+    local EQUIPPED_STROKE = Color3.fromRGB(165, 135, 255) -- brighter purple outline on the item they are holding
+    local EQUIPPED_THICKNESS = 2
     local HL_TILE = Color3.fromRGB(78, 22, 56)   -- tile tint for HIGHLIGHT items
     local WHITE = Color3.fromRGB(255, 255, 255)
     local GRAY = Color3.fromRGB(190, 190, 200)
@@ -1328,9 +1361,11 @@ do
         "ScavKingCrown", "InflatedCrown", "MotorcycleHelmet", "TankerCap",
         -- face / visors
         "MaskaVisor", "AltynVisor", "ZShVisor", "FastVisor", "MikeShades", "IOLA", "Kulon",
+        "GP5", "GP7",
         -- body armor / vests
         "ScavKingVest", "IOTV4", "JPC", "HSPV", "Pantsir3", "DozerArmor",
         "UNOVest", "TORS", "TWS", "6B5", "6B2", "6B23", "6B45",
+        "ConcealedVest", "Smersh", "Bandolier",
         -- bags
         "Attak5", "Lynx", "WastelandBackpack", "Wastelander", "Tortilla", "SpecopsBackpack",
     }
@@ -1338,6 +1373,14 @@ do
     for i = 1, #ARMOR_ORDER do
         if not ARMOR_INDEX[ARMOR_ORDER[i]] then ARMOR_INDEX[ARMOR_ORDER[i]] = i end
     end
+
+    -- Attachment rules (the game item name stays the same, attachments change what is shown)
+    local SUB_SIZE = 18      -- small attachment icon size (px); up to 3 stack in one column
+    local ATT = {
+        fastmt = { "QuadNVG", "TitanShield" },                 -- FastMT with ALL of these is really a GMT
+        visors = { Altyn = { "MaskaVisor", "AltynVisor" } },   -- helmet -> visor corner icon (first one found wins)
+        gun = { "RK2", "Reapir", "PEQ15", "SOCOM556" },        -- gun attachments shown as stacked corner icons
+    }
 
     ----------------------------------------------------------------------
     -- Image cache + background downloader
@@ -1398,6 +1441,8 @@ do
                 why = "error: " .. tostring(data)
             elseif type(data) ~= "string" then
                 why = "returned " .. type(data)
+            elseif #data < 100 and string.sub(data, 1, 3) == "404" then
+                why = "404 not found (" .. fileName .. ".png is not in the repo)"
             else
                 why = #data .. " bytes, format: " .. tostring(imgKind(data) or "unknown")
             end
@@ -1411,7 +1456,18 @@ do
             if item then
                 local data, why = tryDownload(item)
                 if not data and IMG_ALIAS[item] then
-                    data, why = tryDownload(IMG_ALIAS[item])
+                    local d2, w2 = tryDownload(IMG_ALIAS[item])
+                    data = d2
+                    if not d2 then why = why .. " | " .. IMG_ALIAS[item] .. ": " .. tostring(w2) end
+                end
+                if not data then
+                    -- game names and file names can differ in capitalisation (FAL -> Fal.png)
+                    local alt = string.upper(string.sub(item, 1, 1)) .. string.lower(string.sub(item, 2))
+                    if alt ~= item and alt ~= IMG_ALIAS[item] then
+                        local d3, w3 = tryDownload(alt)
+                        data = d3
+                        if not d3 then why = why .. " | " .. alt .. ": " .. tostring(w3) end
+                    end
                 end
                 if data then
                     imgData[item] = data
@@ -1433,12 +1489,12 @@ do
     ----------------------------------------------------------------------
     -- Panel drawings
     ----------------------------------------------------------------------
-    local hbView = Workspace.CurrentCamera.ViewportSize
     -- y = 44 keeps it below the compass bar at the top of the screen
-    local hbPanel = newPanel("hotbar", math.floor((hbView.X - MIN_W) / 2), 44, MIN_W, 60)
+    local hbPanel = newPanel("hotbar", math.floor((Workspace.CurrentCamera.ViewportSize.X - MIN_W) / 2), 44, MIN_W, 60)
 
-    local rPill, rDot, rTitle, rMsgBg, rMsg, rTeamBg, rTeamHead
-    local tiles = {}            -- per tile: bg, img, label (records), hasImg
+    local rPill, rTitle, rMsgBg, rMsg, rTeamBg, rTeamHead
+    local tiles = {}            -- equipment row: per tile bg, stroke, img, label, subBg, sub (records), hasImg, hasSub, eq
+    local hotTiles = {}         -- hotbar-items row (same kind of tiles)
     local rTeamRows = {}
 
     local function make(class, props, ox, oy, isBg)
@@ -1454,10 +1510,6 @@ do
         }, 0, 0, true)
         pcall(function() rPill.d.Corner = PILL_H / 2 end)
 
-        rDot = make("Square", {
-            Filled = true, Color = PURPLE,
-            Size = Vector2.new(6, 6), ZIndex = 2, Visible = false,
-        }, 0, 0)
         rTitle = make("Text", {
             Text = "", Color = WHITE,
             Font = Drawing.Fonts.SystemBold, Size = 12, Center = true,
@@ -1476,8 +1528,8 @@ do
             ZIndex = 2, Visible = false,
         }, 0, 0)
 
-        for i = 1, MAX_TILES do
-            local t = { hasImg = false }
+        local function makeTile()
+            local t = { hasImg = false, nsub = 0, subs = {}, subKey = nil, eq = false }
 
             t.bg = make("Square", {
                 Filled = true, Color = TILE_BG,
@@ -1486,6 +1538,7 @@ do
             pcall(function() t.bg.d.Corner = 8 end)
 
             -- outline around the box; registered as a "bg" drawing so the UI Opacity slider affects it
+            -- (turns brighter purple while the player is holding this item)
             t.stroke = make("Square", {
                 Filled = false, Thickness = 1, Color = STROKE_COLOR,
                 Size = Vector2.new(TILE, TILE), ZIndex = 2, Visible = false,
@@ -1503,8 +1556,25 @@ do
                 ZIndex = 2, Visible = false,
             }, 0, 0)
 
-            tiles[i] = t
+            -- small attachment icons (bottom-right corner of the tile, stacked upward)
+            for k = 1, 4 do
+                local sb = make("Square", {
+                    Filled = true, Color = BG_COLOR,
+                    Size = Vector2.new(SUB_SIZE + 2, SUB_SIZE + 2), ZIndex = 3, Visible = false,
+                }, 0, 0, true)
+                pcall(function() sb.d.Corner = 4 end)
+                local si = make("Image", {
+                    Size = Vector2.new(SUB_SIZE, SUB_SIZE),
+                    ZIndex = 4, Visible = false,
+                }, 0, 0)
+                t.subs[k] = { bg = sb, img = si }
+            end
+
+            return t
         end
+
+        for i = 1, MAX_TILES do tiles[i] = makeTile() end
+        for i = 1, MAX_HOT do hotTiles[i] = makeTile() end
 
         -- team card: always the LAST block of the stack (only while "View Player Teams" is on)
         rTeamBg = make("Square", {
@@ -1528,7 +1598,7 @@ do
 
     if not hbOK then
         destroyPanel(hbPanel)
-        tiles = {}
+        tiles, hotTiles = {}, {}
     end
 
     ----------------------------------------------------------------------
@@ -1536,12 +1606,25 @@ do
     -- for the drawings that are in use)
     ----------------------------------------------------------------------
     local shown = false
-    local eqCount = 0
-    local tileItem = {}          -- [i] = item currently drawn in tile i
+    local eqCount = 0            -- tiles in the equipment row
+    local hotCount = 0           -- tiles in the hotbar-items row (0 = row hidden)
+    local tileItem = {}          -- [i] = item currently drawn in equipment tile i
+    local tileSub = {}           -- [i] = attachment icon name drawn in equipment tile i
+    local hotItem = {}           -- [i] = item currently drawn in hotbar tile i
+    local curEquipped = nil      -- name of the tool the targeted player is holding (EquippedTool)
     local titleStr, msgStr = "Hotbar", ""
     local teamOn = false
     local teamHeadStr = ""
     local teamRowStr, teamRowCount = {}, 0
+
+    -- Fade in / out (the panel stays drawn until the fade-out finishes)
+    -- (stored as fields on hbPanel instead of locals: this chunk is at Lua's 200-local limit)
+    hbPanel.fin = 0.18   -- seconds to fade in
+    hbPanel.fout = 0.12  -- seconds to fade out
+    hbPanel.fa = 0       -- current fade amount (0 = hidden, 1 = fully shown)
+    hbPanel.ft = 0       -- fade target
+    hbPanel.fl = nil     -- last frame time
+    hbPanel.fade = 0     -- eased value used by applyOpacity
 
     local function setVis(r, v)
         v = v and true or false
@@ -1555,22 +1638,41 @@ do
         r.d.Position = Vector2.new(hbPanel.x + r.ox, hbPanel.y + r.oy)
     end
 
-    local function applyVisibility()
-        local s = shown
-        local noGear = s and eqCount == 0
-        setVis(rPill, s)
-        setVis(rDot, s)
-        setVis(rTitle, s)
-        setVis(rMsgBg, noGear)
-        setVis(rMsg, noGear)
-        for i = 1, MAX_TILES do
-            local t = tiles[i]
-            local on = s and i <= eqCount
+    local function setRowVisible(list, count, s)
+        for i = 1, #list do
+            local t = list[i]
+            local on = s and i <= count
             setVis(t.bg, on)
             setVis(t.stroke, on)
             setVis(t.img, on and t.hasImg)
             setVis(t.label, on and not t.hasImg)
+            for k = 1, #t.subs do
+                local sv = on and k <= t.nsub
+                setVis(t.subs[k].bg, sv)
+                setVis(t.subs[k].img, sv)
+            end
         end
+    end
+
+    local function putRow(list, count)
+        for i = 1, count do
+            local t = list[i]
+            put(t.bg)
+            put(t.stroke)
+            if t.hasImg then put(t.img) else put(t.label) end
+            for k = 1, t.nsub do put(t.subs[k].bg); put(t.subs[k].img) end
+        end
+    end
+
+    local function applyVisibility()
+        local s = shown or hbPanel.fa > 0 -- stays drawn while it fades out
+        local noGear = s and eqCount == 0
+        setVis(rPill, s)
+        setVis(rTitle, s)
+        setVis(rMsgBg, noGear)
+        setVis(rMsg, noGear)
+        setRowVisible(hotTiles, hotCount, s)
+        setRowVisible(tiles, eqCount, s)
         local tv = s and teamOn
         setVis(rTeamBg, tv)
         setVis(rTeamHead, tv)
@@ -1579,17 +1681,68 @@ do
         end
     end
 
+    -- Writes Transparency from the fade value (smoothstep ease, like the notification slide).
+    -- allItems = false: only drawings that are currently visible are touched.
+    function hbPanel.writeFade(allItems)
+        local a = hbPanel.fa
+        local e = a * a * (3 - 2 * a)
+        hbPanel.fade = e
+        local bgA, fgA = bgAlpha() * e, fgAlpha() * e
+        local items = hbPanel.items
+        for i = 1, #items do
+            local it = items[i]
+            if allItems or it.vis then
+                it.d.Transparency = it.bg and bgA or fgA
+            end
+        end
+    end
+
+    function hbPanel.fadeTo(target)
+        if target == hbPanel.ft then return end
+        hbPanel.ft = target
+        -- starting from fully hidden: set everything to invisible BEFORE it is shown (no one-frame flash)
+        if target == 1 and hbPanel.fa == 0 then hbPanel.writeFade(true) end
+    end
+
+    RunService.RenderStepped:Connect(function()
+        guarded(function()
+            local a, target = hbPanel.fa, hbPanel.ft
+            if a == target then hbPanel.fl = nil return end -- idle: no work
+
+            local now = tick()
+            local last = hbPanel.fl
+            local dt = last and (now - last) or 0
+            hbPanel.fl = now
+            if dt > 0.05 then dt = 0.05 end -- lag spike protection
+
+            if target > a then
+                a = a + dt / hbPanel.fin
+                if a > 1 then a = 1 end
+            else
+                a = a - dt / hbPanel.fout
+                if a < 0 then a = 0 end
+            end
+            hbPanel.fa = a
+
+            hbPanel.writeFade(a == 1)                -- on completion, also refresh hidden drawings
+            if a == 0 then applyVisibility() end     -- fade-out done: actually hide everything
+        end)
+    end)
+
     -- Recomputes size + offsets (only called when something changed), keeps the
     -- panel centered on its current middle, then writes the positions in use.
     -- The panel is a vertical stack of blocks, every block centered:
-    --   1) name pill   2) equipment tiles (or a message card)
-    --   (future rows: hotbar items, equipped items go between 2 and 3)
-    --   3) team card  <- always the very last block
+    --   1) name pill
+    --   2) hotbar items (ItemBack1/2, Hotbar4-8)  <- only when at least one slot is filled
+    --   3) equipment tiles (or a message card)
+    --   4) team card  <- always the very last block
     local function layout()
         applyVisibility() -- hide stale stuff first
 
         local n = eqCount
-        local pillW = #titleStr * 6 + 44   -- same padding left and right of the centered name
+        local hn = hotCount
+        local pillW = #titleStr * 6 + 36   -- same padding left and right of the centered name
+        local hotW = (hn > 0) and (hn * TILE + (hn - 1) * GAP) or 0
         local tilesW = (n > 0) and (n * TILE + (n - 1) * GAP) or 0
         local msgW = (n == 0) and (#msgStr * 6.5 + PAD * 2) or 0
         local teamW = 0
@@ -1603,6 +1756,7 @@ do
         end
 
         local W = pillW
+        if hotW > W then W = hotW end
         if tilesW > W then W = tilesW end
         if msgW > W then W = msgW end
         if teamW > W then W = teamW end
@@ -1615,27 +1769,47 @@ do
 
         local function cx(w) return math.floor((W - w) / 2) end
 
+        -- places one row of tiles (centered) with its top edge at `top`
+        local function placeRow(list, count, top)
+            local x0 = cx(count * TILE + (count - 1) * GAP)
+            for i = 1, count do
+                local t = list[i]
+                local x = x0 + (i - 1) * (TILE + GAP)
+                t.bg.ox, t.bg.oy = x, top
+                t.stroke.ox, t.stroke.oy = x, top
+                t.img.ox, t.img.oy = x + IMG_PAD, top + IMG_PAD
+                t.label.ox, t.label.oy = x + TILE / 2, top + TILE / 2 - 1   -- Center = true centers on both axes
+                -- small attachment icons: bottom-right corner, 3 per column stacked upward,
+                -- a 4th icon starts a second column to the left
+                for k = 1, #t.subs do
+                    local col, row = math.floor((k - 1) / 3), (k - 1) % 3
+                    local bx = x + TILE - (SUB_SIZE + 2) - 2 - col * (SUB_SIZE + 3)
+                    local by = top + TILE - (SUB_SIZE + 2) - 2 - row * (SUB_SIZE + 3)
+                    t.subs[k].bg.ox, t.subs[k].bg.oy = bx, by
+                    t.subs[k].img.ox, t.subs[k].img.oy = bx + 1, by + 1
+                end
+            end
+        end
+
         -- 1) name pill
         local pillX = cx(pillW)
         rPill.ox, rPill.oy = pillX, 0
         rPill.d.Size = Vector2.new(pillW, PILL_H)
-        rDot.ox, rDot.oy = pillX + 10, (PILL_H - 6) / 2
-        rTitle.ox, rTitle.oy = pillX + pillW / 2, 5   -- Center = true: x is the middle of the text
+        -- Center = true centers the text on BOTH axes (x and y are its middle point), so y is the pill's middle
+        rTitle.ox, rTitle.oy = pillX + pillW / 2 + TITLE_NUDGE_X, PILL_H / 2 - 1
         -- only the pill grabs the mouse for dragging (see dragStep)
         hbPanel.hx, hbPanel.hw = pillX, pillW
         local y = PILL_H + PILL_GAP
 
-        -- 2) equipment tiles, or a small message card when there is nothing to show
+        -- 2) hotbar items: only shown when at least one slot has something in it
+        if hn > 0 then
+            placeRow(hotTiles, hn, y)
+            y = y + TILE + SECTION_GAP
+        end
+
+        -- 3) equipment tiles, or a small message card when there is nothing to show
         if n > 0 then
-            local x0 = cx(tilesW)
-            for i = 1, n do
-                local t = tiles[i]
-                local x = x0 + (i - 1) * (TILE + GAP)
-                t.bg.ox, t.bg.oy = x, y
-                t.stroke.ox, t.stroke.oy = x, y
-                t.img.ox, t.img.oy = x + IMG_PAD, y + IMG_PAD
-                t.label.ox, t.label.oy = x + TILE / 2, y + TILE / 2 - 6
-            end
+            placeRow(tiles, n, y)
             y = y + TILE
         else
             local mx = cx(msgW)
@@ -1645,14 +1819,11 @@ do
             y = y + 24
         end
 
-        -- (future rows go HERE: hotbar items, equipped items; each one: y = y + SECTION_GAP, place, y = y + height)
-
-        -- 3) team card: ALWAYS the last block, under everything else
-        local cardH = 0
+        -- 4) team card: ALWAYS the last block, under everything else
         if teamOn then
             y = y + SECTION_GAP
             local cardX = cx(teamW)
-            cardH = CARD_PAD * 2 + 14 + ((teamRowCount > 0) and (4 + teamRowCount * 14) or 0)
+            local cardH = CARD_PAD * 2 + 14 + ((teamRowCount > 0) and (4 + teamRowCount * 14) or 0)
             rTeamBg.ox, rTeamBg.oy = cardX, y
             rTeamBg.d.Size = Vector2.new(teamW, cardH)
             rTeamHead.ox, rTeamHead.oy = cardX + CARD_PAD, y + CARD_PAD
@@ -1665,14 +1836,10 @@ do
         hbPanel.h = y
 
         -- positions of the drawings in use
-        put(rPill); put(rDot); put(rTitle)
+        put(rPill); put(rTitle)
         if n == 0 then put(rMsgBg); put(rMsg) end
-        for i = 1, n do
-            local t = tiles[i]
-            put(t.bg)
-            put(t.stroke)
-            if t.hasImg then put(t.img) else put(t.label) end
-        end
+        putRow(hotTiles, hn)
+        putRow(tiles, n)
         if teamOn then
             put(rTeamBg); put(rTeamHead)
             for i = 1, teamRowCount do put(rTeamRows[i]) end
@@ -1684,10 +1851,13 @@ do
         return name
     end
 
-    local function applyTile(i, item)
-        tileItem[i] = item
-        local t = tiles[i]
+    -- colors + icon of one tile; isEq = the player is holding this item right now;
+    -- sub = optional small corner icon (attachment)
+    local function styleTile(t, item, isEq, sub)
+        t.eq = isEq
         t.bg.d.Color = HIGHLIGHT[item] and HL_TILE or TILE_BG
+        t.stroke.d.Color = isEq and EQUIPPED_STROKE or STROKE_COLOR
+        t.stroke.d.Thickness = isEq and EQUIPPED_THICKNESS or 1
         if imgState[item] == "ok" then
             t.img.d.Data = imgData[item]
             t.hasImg = true
@@ -1695,52 +1865,79 @@ do
             t.hasImg = false
             t.label.d.Text = shortName(item)
         end
+        -- sub = comma separated icon names ("RK2,PEQ15"), or a single name, or nil
+        t.subKey = sub or ""
+        local ns = 0
+        if sub and sub ~= "" then
+            for nm in string.gmatch(sub, "[^,]+") do
+                if ns >= #t.subs then break end
+                if imgState[nm] == "ok" then
+                    ns = ns + 1
+                    t.subs[ns].img.d.Data = imgData[nm]
+                end
+            end
+        end
+        t.nsub = ns
+    end
+
+    local function applyTile(i, item, sub)
+        tileItem[i] = item
+        tileSub[i] = sub
+        styleTile(tiles[i], item, curEquipped ~= nil and item == curEquipped, sub)
     end
 
     ----------------------------------------------------------------------
     -- Reading the equipment
     ----------------------------------------------------------------------
-    local wornTmp = {}
-
-    local function scanDirect(parent)
-        local kids = parent:GetChildren()
-        for i = 1, #kids do
-            local c = kids[i]
-            if c.ClassName == "Folder" then
-                scanDirect(c) -- plain container
-            else
-                local idx = ARMOR_INDEX[c.Name]
-                if idx then wornTmp[idx] = c.Name end
-            end
+    local function hasAll(atts, names)
+        for i = 1, #names do
+            if not atts:FindFirstChild(names[i]) then return false end
         end
+        return true
     end
 
-    -- Fills out[1..n] with the gear names found (ARMOR_ORDER order). Returns found, n.
-    local function readEquipment(name, out)
+    -- Looks up every name from ARMOR_ORDER directly under Inventory (no descendant scan).
+    -- out[i] = icon/display name (FastMT may become GMT), subOut[i] = small corner icon or nil
+    -- Returns found, n.
+    local function readEquipment(name, out, subOut)
         local folder = getPlayersFolder()
         local inv = folder and folder:FindFirstChild(name)
         inv = inv and inv:FindFirstChild("Inventory")
         if not inv then return false, 0 end
 
-        for k in pairs(wornTmp) do wornTmp[k] = nil end
-        if EQUIP_NESTED then
-            local d = inv:GetDescendants()
-            local limit = #d
-            if limit > EQUIP_MAX_NODES then limit = EQUIP_MAX_NODES end
-            for i = 1, limit do
-                local idx = ARMOR_INDEX[d[i].Name]
-                if idx then wornTmp[idx] = d[i].Name end
-            end
-        else
-            scanDirect(inv)
-        end
-
         local n = 0
-        for idx = 1, #ARMOR_ORDER do
-            local nm = wornTmp[idx]
-            if nm and n < MAX_TILES then
-                n = n + 1
-                out[n] = nm
+        for i = 1, #ARMOR_ORDER do
+            if n >= MAX_TILES then break end
+            local gear = ARMOR_ORDER[i]
+            local inst = inv:FindFirstChild(gear)
+            if inst then
+                local shownName, sub = gear, nil
+                local atts = inst:FindFirstChild("Attachments")
+                if atts then
+                    if gear == "FastMT" then
+                        if hasAll(atts, ATT.fastmt) then shownName = "GMT" end
+                    else
+                        local visors = ATT.visors[gear]
+                        if visors then
+                            for v = 1, #visors do
+                                if atts:FindFirstChild(visors[v]) then
+                                    sub = visors[v]
+                                    break
+                                end
+                            end
+                        end
+                    end
+                end
+
+                local dup = false -- e.g. a real GMT next to a FastMT shown as GMT
+                for k = 1, n do
+                    if out[k] == shownName then dup = true break end
+                end
+                if not dup then
+                    n = n + 1
+                    out[n] = shownName
+                    subOut[n] = sub
+                end
             end
         end
         return true, n
@@ -1841,15 +2038,133 @@ do
     ----------------------------------------------------------------------
     -- Called from infoStep (every INFO_SELECT_EVERY seconds)
     ----------------------------------------------------------------------
+    ----------------------------------------------------------------------
+    -- HOTBAR + EQUIPPED TOOL
+    --   ReplicatedStorage.Players.<name>.Status.GameplayVariables.Hotbar.<slot>
+    --   ReplicatedStorage.Players.<name>.Status.GameplayVariables.EquippedTool
+    -- A slot / the tool can be stored as a String/Object value, as an attribute, or as an
+    -- item sitting inside the slot; all of those are understood (use "Hotbar Debug" to see
+    -- what the game really uses). Empty / missing slots are skipped.
+    ----------------------------------------------------------------------
+    -- turns a stored value (string, or an instance such as an ObjectValue target) into an item name
+    -- (an EMPTY ObjectValue gives the placeholder name "Unreadable_name": that counts as empty)
+    local function nameOf(v)
+        if v == nil then return nil end
+        if type(v) == "string" then
+            if v == "" or v == "Unreadable_name" then return nil end
+            return v
+        end
+        if type(v) == "number" or type(v) == "boolean" then return nil end
+        local ok, nm = pcall(function() return v.Name end)
+        if ok and type(nm) == "string" and nm ~= "" and nm ~= "Unreadable_name" then return nm end
+        return nil
+    end
+
+    -- FindFirstChild that ignores capitalisation (the slots are called Itemback1 / ItemBack1 ...)
+    local function findCI(parent, name)
+        local c = parent:FindFirstChild(name)
+        if c then return c end
+        local lower = string.lower(name)
+        local kids = parent:GetChildren()
+        for i = 1, #kids do
+            if string.lower(kids[i].Name) == lower then return kids[i] end
+        end
+        return nil
+    end
+
+    -- item name stored under <parent>.<key>, or nil when empty / missing
+    local function readItemName(parent, key)
+        local n = nameOf(parent:GetAttribute(key))
+        if n then return n end
+        local c = findCI(parent, key)
+        if not c then return nil end
+        local okv, v = pcall(function() return c.Value end)
+        if okv then
+            n = nameOf(v)
+            if n then return n end
+        end
+        local kids = c:GetChildren()
+        if #kids > 0 then return kids[1].Name end
+        return nil
+    end
+
+    local function gameplayVars(name)
+        local folder = getPlayersFolder()
+        local n = folder and folder:FindFirstChild(name)
+        n = n and n:FindFirstChild("Status")
+        return n and n:FindFirstChild("GameplayVariables")
+    end
+
+    -- Fills out[1..n] with the items in the hotbar slots (slot order, empty slots skipped).
+    -- Returns n and the name of the held tool (nil when nothing is equipped).
+    local function readHotbar(name, out)
+        local gv = gameplayVars(name)
+        if not gv then return 0, nil end
+        local src = findCI(gv, "Hotbar") or gv
+        local n = 0
+        for i = 1, #HOT_SLOTS do
+            local item = readItemName(src, HOT_SLOTS[i])
+            if item then
+                n = n + 1
+                out[n] = item
+            end
+        end
+        return n, readItemName(gv, "EquippedTool")
+    end
+
+    -- An M4 with ALL of Reapir + PEQ15 + Mag556Rnd100 + SOCOM556 under Inventory.M4.Attachments is a GODM4
+    -- (icon GODM4.png). Only called when a hotbar slot holds an "M4".
+    local function isGodM4(name)
+        local folder = getPlayersFolder()
+        local m4 = folder and folder:FindFirstChild(name)
+        m4 = m4 and m4:FindFirstChild("Inventory")
+        m4 = m4 and m4:FindFirstChild("M4")
+        local atts = m4 and m4:FindFirstChild("Attachments")
+        if not atts then return false end
+        return atts:FindFirstChild("Reapir") ~= nil
+            and atts:FindFirstChild("PEQ15") ~= nil
+            and atts:FindFirstChild("Mag556Rnd100") ~= nil
+            and atts:FindFirstChild("SOCOM556") ~= nil
+    end
+
+    -- Comma separated list of the ATT.gun attachments found anywhere under Inventory.<gun>.Attachments
+    -- (in ATT.gun order, e.g. "RK2,PEQ15"), or nil when there are none.
+    local function gunAtts(name, gun)
+        local folder = getPlayersFolder()
+        local g = folder and folder:FindFirstChild(name)
+        g = g and g:FindFirstChild("Inventory")
+        g = g and g:FindFirstChild(gun)
+        local atts = g and g:FindFirstChild("Attachments")
+        if not atts then return nil end
+        -- look through everything under Attachments, so nested ones count too
+        -- (e.g. Inventory.M4.Attachments.FrontMK12.Attachments.RK2); works for any gun
+        local d = atts:GetDescendants()
+        local key
+        local list = ATT.gun
+        for i = 1, #list do
+            for j = 1, #d do
+                if d[j].Name == list[i] then
+                    key = key and (key .. "," .. list[i]) or list[i]
+                    break
+                end
+            end
+        end
+        return key
+    end
+
+    local hotTarget, hotLastRead = nil, 0
+    local hotRead = {}
+
     local curTarget, lastRead = nil, 0
     local teamTarget, teamLastRead = nil, 0
-    local eqRead = {}
+    local eqRead, eqSub = {}, {}
 
-    function hotbarStep(target, now, wantTeams)
+    function hotbarStep(target, now, wantTeams, wantAtt)
         if not hbOK then return end
         local dirty = false
 
         local wantTeamRow = (wantTeams and target ~= nil) and true or false
+        if target == nil and hbPanel.fa > 0 then wantTeamRow = teamOn end -- keep the team card while fading out
         if wantTeamRow ~= teamOn then
             teamOn = wantTeamRow
             if teamOn then teamTarget = nil end -- read right away
@@ -1859,15 +2174,18 @@ do
         if target then
             if imgDirty then
                 imgDirty = false
-                for i = 1, MAX_TILES do tileItem[i] = nil end -- re-apply tiles with the new icons
+                for i = 1, MAX_TILES do tileItem[i] = nil; tileSub[i] = nil end -- re-apply tiles with the new icons
+                for i = 1, MAX_HOT do hotItem[i] = nil end
                 lastRead = 0
+                hotLastRead = 0
             end
 
-            if target ~= curTarget or now - lastRead >= EQUIP_REFRESH then
+            if target ~= curTarget or now - lastRead >= EQUIP_REFRESH or hbPanel.att ~= wantAtt then
                 curTarget = target
                 lastRead = now
+                hbPanel.att = wantAtt -- remembers the toggle so flipping it updates right away
 
-                local found, n = readEquipment(target, eqRead)
+                local found, n = readEquipment(target, eqRead, eqSub)
 
                 local title = target
                 if title ~= titleStr then
@@ -1893,13 +2211,66 @@ do
                     dirty = true
                 end
                 for i = 1, n do
-                    local item = eqRead[i]
-                    if tileItem[i] ~= item then
-                        applyTile(i, item)
+                    local item, sub = eqRead[i], eqSub[i]
+                    if not wantAtt then sub = nil end -- "Attachment Icons" is off: no corner icons
+                    if tileItem[i] ~= item or tileSub[i] ~= sub then
+                        applyTile(i, item, sub)
                         dirty = true
                     end
                     -- still no icon: (re)request it; retries are throttled by IMG_RETRY
                     if not tiles[i].hasImg then requestImage(item) end
+                    if sub then requestImage(sub) end
+                end
+            end
+
+            -- hotbar slots + equipped tool (fast refresh so weapon swaps show up quickly)
+            if target ~= hotTarget or now - hotLastRead >= HOT_REFRESH then
+                hotTarget = target
+                hotLastRead = now
+
+                local hn, equipped = readHotbar(target, hotRead)
+                if hn > MAX_HOT then hn = MAX_HOT end
+                curEquipped = equipped
+
+                if hn ~= hotCount then
+                    hotCount = hn
+                    dirty = true
+                end
+
+                local used = false -- only the first tile with the held item gets the "equipped" look
+                for i = 1, hn do
+                    local raw = hotRead[i]          -- name in the game files
+                    local item = raw                -- name / icon shown
+                    local key = nil                 -- attachment corner icons
+                    if raw == "M4" and isGodM4(target) then
+                        item = "GODM4"              -- the GODM4 icon already covers its attachments
+                    elseif wantAtt then
+                        key = gunAtts(target, raw)
+                    end
+                    local isEq = false
+                    if not used and curEquipped ~= nil and raw == curEquipped then
+                        isEq = true
+                        used = true
+                    end
+                    local t = hotTiles[i]
+                    if hotItem[i] ~= item or t.eq ~= isEq or t.subKey ~= (key or "") then
+                        hotItem[i] = item
+                        styleTile(t, item, isEq, key)
+                        dirty = true
+                    end
+                    if not t.hasImg then requestImage(item) end
+                    if key then
+                        for nm in string.gmatch(key, "[^,]+") do requestImage(nm) end
+                    end
+                end
+
+                -- the equipment row can show the held item too
+                for i = 1, eqCount do
+                    local isEq = (curEquipped ~= nil and tileItem[i] == curEquipped)
+                    if tiles[i].eq ~= isEq then
+                        styleTile(tiles[i], tileItem[i], isEq, tileSub[i])
+                        dirty = true
+                    end
                 end
             end
 
@@ -1924,14 +2295,18 @@ do
             if not shown then
                 shown = true
                 hbPanel.shown = true
+                hbPanel.fadeTo(1)
                 dirty = true
             end
         else
             curTarget = nil
             teamTarget = nil
+            hotTarget = nil
+            curEquipped = nil
             if shown then
                 shown = false
                 hbPanel.shown = false
+                hbPanel.fadeTo(0)
                 dirty = true
             end
         end
@@ -1952,6 +2327,41 @@ do
                 print("[Hotbar debug] no target - look at a player (or use Hotbar Target = Myself), then click again")
                 return
             end
+
+            -- GameplayVariables / Hotbar / EquippedTool: what the hotbar row reads
+            local okG, errG = pcall(function()
+                local gv = gameplayVars(target)
+                if not gv then
+                    print("[Hotbar debug] no Status.GameplayVariables found for " .. target)
+                    return
+                end
+                local function describe(inst)
+                    local okv, v = pcall(function() return inst.Value end)
+                    local kids = inst:GetChildren()
+                    return inst.Name .. " [" .. inst.ClassName .. "]"
+                        .. (okv and (" = " .. tostring(v)) or "")
+                        .. ((#kids > 0) and (" (" .. #kids .. " children)") or "")
+                end
+                local list = gv:GetChildren()
+                for i = 1, #list do
+                    print("[Hotbar debug] GameplayVariables: " .. describe(list[i]))
+                end
+                local hb = findCI(gv, "Hotbar")
+                if hb then
+                    local slots = hb:GetChildren()
+                    for i = 1, #slots do
+                        print("[Hotbar debug] Hotbar slot: " .. describe(slots[i]))
+                    end
+                else
+                    print("[Hotbar debug] no Hotbar child in GameplayVariables (slots are read from GameplayVariables itself)")
+                end
+                local hn, eq = readHotbar(target, hotRead)
+                local names = {}
+                for i = 1, hn do names[#names + 1] = hotRead[i] end
+                print("[Hotbar debug] hotbar items read (" .. hn .. "): " .. table.concat(names, ", ")
+                    .. " | equipped tool: " .. tostring(eq))
+            end)
+            if not okG then print("[Hotbar debug] GameplayVariables error: " .. tostring(errG)) end
 
             local ok, err = pcall(function()
                 local folder = getPlayersFolder()
@@ -1982,7 +2392,16 @@ do
                 local item = tileItem[i]
                 if item then
                     print("[Hotbar debug] tile " .. i .. ": " .. item .. " | icon: " .. tostring(imgState[item])
-                        .. " | " .. tostring(imgInfo[item]) .. " | drawn as image: " .. tostring(tiles[i].hasImg))
+                        .. " | " .. tostring(imgInfo[item]) .. " | drawn as image: " .. tostring(tiles[i].hasImg)
+                        .. " | corner icon: " .. tostring(tileSub[i]))
+                end
+            end
+
+            for i = 1, hotCount do
+                local item = hotItem[i]
+                if item then
+                    print("[Hotbar debug] hotbar tile " .. i .. ": " .. item .. " | icon: " .. tostring(imgState[item])
+                        .. " | " .. tostring(imgInfo[item]) .. " | equipped look: " .. tostring(hotTiles[i].eq))
                 end
             end
 
@@ -1990,7 +2409,7 @@ do
             for i = 1, eqCount do
                 local item = tileItem[i]
                 if item and not tiles[i].hasImg then
-                    local url = IMG_BASE .. item .. ".png"
+                    local url = IMG_BASES[2] .. item .. ".png"
                     print("[Hotbar debug] test download: " .. url)
                     local ok2, data = pcall(fetch, url)
                     if not ok2 then
@@ -2022,6 +2441,7 @@ local function infoStep()
     local wantInv = invOK and UI.GetValue("opt_inv")
     local wantHotbar = hbOK and UI.GetValue("opt_hotbar")
     local wantTeams = UI.GetValue("opt_teams") == true
+    local wantAtt = UI.GetValue("opt_attico") == true
     local hbSelf = UI.GetValue("hotbar_target") == 1
 
     local needLook = wantInfo or wantInv or (wantHotbar and not hbSelf)
@@ -2057,9 +2477,9 @@ local function infoStep()
 
     -- Hotbar (looked-at player, or yourself)
     if wantHotbar then
-        hotbarStep(hbSelf and LOCAL_NAME or target, now, wantTeams)
+        hotbarStep(hbSelf and LOCAL_NAME or target, now, wantTeams, wantAtt)
     else
-        hotbarStep(nil, now, false)
+        hotbarStep(nil, now, false, false)
     end
 end
 
