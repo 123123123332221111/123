@@ -1,4 +1,4 @@
--- Matcha LuaVM: FurryHook (draggable + transparent UI, equipment Hotbar)
+-- Matcha LuaVM: FuzzyHook - PRIVATE (draggable + transparent UI, equipment Hotbar)
 -- Notes:
 --  * UI.AddTab's callback runs every frame, so it only reads pre-built data
 --    (no closures / string building inside it).
@@ -11,6 +11,8 @@
 --    if everything loaded without a problem.
 --  * God Mode detection lives inside the Staff List block (it shares that block's
 --    scan loop, so it is controlled by the "Staff Alert" toggle).
+--  * Performance Mode (Settings section) turns off the Hotbar fade and the
+--    notification slide animations. The flag lives in Notification.perf.
 
 local Players, ReplicatedStorage, RunService, Workspace
 -- Username is resolved ONCE at launch and reused by every feature below.
@@ -34,7 +36,7 @@ do
     end
 
     if not (Players and ReplicatedStorage and RunService and Workspace and LOCAL_NAME) then
-        warn("FurryHook: the game did not finish loading, script stopped")
+        warn("FuzzyHook - PRIVATE: the game did not finish loading, script stopped")
         return
     end
 end
@@ -362,6 +364,8 @@ end
 --   Notification.push("Title", "Message")
 --   Notification.push("Title", "Message", { seconds = 15, color = Color3.fromRGB(255,160,0) })
 -- "color" is the color of the dot next to the title.
+-- Notification.perf = true (Performance Mode) skips the slide animations; the
+-- Hotbar fade reads the same flag.
 ----------------------------------------------------------------------
 local Notification = {}
 do
@@ -477,7 +481,8 @@ do
         end)
 
         if built then
-            n.t0 = tick()
+            -- Performance Mode: start already "settled" so there is no slide-in
+            n.t0 = tick() - (Notification.perf and SLIDE_TIME or 0)
             notes[#notes + 1] = n
         else
             loadErrors = loadErrors + 1
@@ -490,13 +495,14 @@ do
     local function noteStep()
         if #notes == 0 then return end -- nothing on screen: no work at all
         local now = tick()
+        local perf = Notification.perf == true -- Performance Mode: no slide animations
         local i = 1
         while i <= #notes do
             local n = notes[i]
             local age = now - n.t0
             local holdEnd = SLIDE_TIME + n.seconds
 
-            if age < SLIDE_TIME then
+            if age < SLIDE_TIME and not perf then
                 -- slide in (ease-out: fast at first, settles gently)
                 local inv = 1 - age / SLIDE_TIME
                 setOffset(n, OFFSCREEN * inv * inv * inv)
@@ -509,7 +515,7 @@ do
                 end
                 setTimer(n, math.ceil(holdEnd - age))
                 i = i + 1
-            elseif age < holdEnd + SLIDE_TIME then
+            elseif age < holdEnd + SLIDE_TIME and not perf then
                 -- slide out to the right (ease-in: starts gently, speeds up)
                 local t = (age - holdEnd) / SLIDE_TIME
                 setOffset(n, OFFSCREEN * t * t * t)
@@ -622,11 +628,17 @@ end
 -- If the menu font cannot draw the emoji and shows boxes / "?", swap them for "/!\" here.
 local DEBUG_TITLE = "\u{26A0}\u{FE0F} Debug Options \u{26A0}\u{FE0F}"
 
-UI.AddTab("FurryHook", function(tab)
+UI.AddTab("FuzzyHook - PRIVATE", function(tab)
     -- Left column: toggles
     addToggleSection(tab, "Important Toggles", "Left", IMPORTANT_TOGGLES)
     addToggleSection(tab, "Server Toggles", "Left", SERVER_TOGGLES)
     addToggleSection(tab, "Inventory Toggles", "Left", INVENTORY_TOGGLES)
+
+    -- Settings: Performance Mode turns off the Hotbar fade and the notification slide
+    local settings = tab:Section("Settings", "Left")
+    settings:SliderFloat("ui_opacity", "UI Opacity", 0.3, 1.0, DEFAULT_OPACITY, "%.2f")
+    settings:Toggle("opt_perf", "Performance Mode", false)
+    settings:Tip("Disables the Hotbar fade and notification slide animations")
 
     -- Right column: status, Inv Aim filters, then Debug Options at the bottom
     local status = tab:Section("Status", "Right")
@@ -642,7 +654,6 @@ UI.AddTab("FurryHook", function(tab)
 
     -- Debug Options (same widgets / ids as the old "Interface" section, so saved values keep working)
     local iface = tab:Section(DEBUG_TITLE, "Right")
-    iface:SliderFloat("ui_opacity", "UI Opacity", 0.3, 1.0, DEFAULT_OPACITY, "%.2f")
     iface:Combo("hotbar_target", "Hotbar Target", HOTBAR_MODES, 0)
     iface:Button("Reset UI Positions", onResetClick)
     iface:Button("Test Notification", onTestNotifyClick)
@@ -1314,7 +1325,8 @@ do
     -- Failed downloads are retried every IMG_RETRY seconds.
     -- FADE: the whole panel fades in when it goes onto a player and fades out when it
     -- goes off (see FADE_IN_TIME / FADE_OUT_TIME). The fade only runs while it is
-    -- animating; idle or hidden it costs one comparison per frame.
+    -- animating; idle or hidden it costs one comparison per frame. With Performance
+    -- Mode on, the fade is skipped and the panel just appears / disappears.
     -- "Hotbar Debug (prints)" (Debug Options) prints what the hotbar sees for the shown
     -- player and why an icon is not loading.
     ----------------------------------------------------------------------
@@ -1708,6 +1720,15 @@ do
         guarded(function()
             local a, target = hbPanel.fa, hbPanel.ft
             if a == target then hbPanel.fl = nil return end -- idle: no work
+
+            -- Performance Mode: skip the fade and jump straight to the target
+            if Notification.perf then
+                hbPanel.fa = target
+                hbPanel.fl = nil
+                hbPanel.writeFade(true)
+                if target == 0 then applyVisibility() end -- fully hidden: actually hide everything
+                return
+            end
 
             local now = tick()
             local last = hbPanel.fl
@@ -3209,8 +3230,12 @@ end
 
 ----------------------------------------------------------------------
 -- UI OPACITY (slider in the Interface section; applied only when it changes)
+-- Also feeds the Performance Mode toggle into Notification.perf (checked here
+-- every 0.2s so no extra loop is needed; the Hotbar fade and the notification
+-- slide both read that flag).
 ----------------------------------------------------------------------
 local function opacityStep()
+    Notification.perf = UI.GetValue("opt_perf") == true
     local v = UI.GetValue("ui_opacity")
     if type(v) == "number" and v ~= uiOpacity then
         uiOpacity = v
@@ -3293,6 +3318,6 @@ task.spawn(function()
         and getPlayersFolder() ~= nil
         and loadErrors == 0
     if allGood then
-        print("FuzzHook has loaded without any errors")
+        print("FuzzyHook - PRIVATE has loaded without any errors")
     end
 end)
