@@ -847,7 +847,7 @@ end
 -- If the menu font cannot draw the emoji and shows boxes / "?", swap them for "/!\" here.
 local DEBUG_TITLE = "\u{26A0}\u{FE0F} Debug Options \u{26A0}\u{FE0F}"
 
-UI.AddTab("FuzzyHook - dev build", function(tab)
+UI.AddTab("FuzzyHook - PRIVATE", function(tab)
     -- Left column: toggles
     local important = addToggleSection(tab, "Important Toggles", "Left", IMPORTANT_TOGGLES)
     important:Text(reportLabel)
@@ -4237,6 +4237,6 @@ task.spawn(function()
         and getPlayersFolder() ~= nil
         and loadErrors == 0
     if allGood then
-        print("FuzzyHook - DEV has loaded without any errors MAY be unstable | updated last 10/29/2026")
+        print("FuzzyHook - PRIVATE has loaded without any errors")
     end
 end)
