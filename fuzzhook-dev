@@ -279,6 +279,188 @@ BlueCard
 BlueKeycard
 OrangeKeycard
 RedKeycard
+
+! weapons !
+ADAR15
+AKM
+AKMN
+AsVal
+FAL
+FlareGun
+Groza
+IZh12
+IZh81
+M4
+MK23
+Makarov
+Mosin
+MP443
+MP5SD
+NagantRevolver
+PKM
+PPSH41
+R700
+RPG7
+SKS
+SVD
+Saiga12
+SPSh44
+TFZ0
+TFZ98S
+TOZ106
+TT33
+VZ61
+
+! grenades !
+F1
+Fuze
+M84
+RGD5
+RGO
+MON50
+PMN2
+Snowball
+GrenadeTrap
+
+! ARMOR !
+6B2
+6B23
+6B27
+6B43
+6B47
+6B5
+Altyn
+AltynVisor
+ConcealedVest
+DozerArmor
+FastMT
+FastVisor
+HSPV
+IOTV4
+JPC
+LegArmor
+Lvl4Plate
+MaskaVisor
+MotorcycleHelmet
+MotorcycleHelmetVisor
+LowCutVisor
+Pantsir3
+SSH68
+ScavKingHelmet
+ScavKingVest
+Smersh
+TitanShield
+UNOHelmet
+UNOVest
+ZSh
+ZShVisor
+
+! Clothing !
+Balaclava
+CamoPants
+CamoShirt
+CivilianPants
+CivilianShirt
+CombatGloves
+GhillieHood
+GhillieLegs
+GhillieTorso
+GorkaPants
+GorkaShirt
+GP5
+HandWraps
+KneePads
+SewnMask
+SummerPants
+SummerShirt
+WastelandPants
+WastelandShirt
+SantaHat
+TankCap
+
+! BAGS !
+Bandoiler
+SpecopsBackpack
+WastelandBackpack
+
+! Keys !
+ATCKey
+AirfieldTunnelsKey
+Apartment13Key
+Apartment21Key
+B05Key
+CitySubstationtKey
+CraneKey
+DormA211Key
+DormB203Key
+EVACKey
+FactoryGarageKey
+FrigateKey
+FuelingStationKey
+GallerySecurityKey
+HydroBasementKey
+LighthouseKey
+PoolKey
+Villa1Key
+VillageKey
+
+! Keycards !
+BlueCard
+OrangeCard
+RedCard
+
+! Electronics !
+GPU
+CPU
+HDD
+SSD
+RAM
+PSU
+ThermalModule
+PDA
+Smartphone
+PortableConsole
+DAGR
+Radio
+
+! Valuable !
+Gold50g
+GoldSkull
+GoldWatch
+GoldenTicket
+GoldenDV2
+GoldenMakarov
+RealGoldenDV2
+EnzoPlush
+DozerPlush
+AntonPlush
+WhisperPlush
+CatToken
+InflatedCrown
+SolterStatue
+Matryoshka
+WeddingRing
+MikeShades
+Football
+Teapot
+
+! Stims !
+SerumGreen
+SerumPurple
+SerumRed
+SerumYellow
+ImmunsterReactor
+
+! Meds !
+WoundDressing
+
+! Misc !
+GiftTier1
+GiftTier2
+GiftTier3
+Rubles
+QuadNVG
+ONV9
 ]]
 
 -- Parsed once at load:
@@ -591,6 +773,11 @@ for _, cat in ipairs(CATEGORIES) do
         id = "hide_cat_" .. idSuffix,
         label = "Filter " .. cat,
         cb = printToggle("Filter " .. cat),
+        -- Dropped Item ESP filter for the same category (ON = hide that category's items).
+        -- Defaults keep the original ESP list: weapons, armor, bags, food, meds, stims, valuables.
+        espId = "esp_hide_cat_" .. idSuffix,
+        espDefault = not (cat == "Weapons" or cat == "Armor" or cat == "Bags" or cat == "Food"
+            or cat == "Meds" or cat == "Stims" or cat == "Valuable" or cat == "Super Valuable"),
     }
 end
 
@@ -665,17 +852,52 @@ UI.AddTab("FuzzyHook - PRIVATE", function(tab)
     addToggleSection(tab, "Server Toggles", "Left", SERVER_TOGGLES)
     addToggleSection(tab, "Inventory Toggles", "Left", INVENTORY_TOGGLES)
 
-    -- World Toggles: Dropped Item ESP (no functionality yet: only the toggle, keybind and range slider)
+    -- World Toggles: Dropped Item ESP (toggle + keybind + range + text size), Corpse ESP (toggle +
+    -- keybind + range; no functionality yet), then the Dropped Item filters.
+    -- Matcha has no divider widget, so the dividers are dashed text lines.
     local world = tab:Section("World Toggles", "Left")
     world:Toggle("opt_dropesp", "Dropped Item ESP", false)
-    world:Keybind("opt_dropesp_kb", 0, "toggle") -- unbound by default: click it in the menu to pick a key
+    Notification.kbDrop = world:Keybind("opt_dropesp_kb", 0, "toggle") -- unbound by default: click it in the menu to pick a key
     world:SliderInt("dropesp_range", "Range (studs)", 1, 1000, 500)
+    world:SliderInt("dropesp_textsize", "Item ESP Text Size", 8, 30, 14)
+    world:Spacing()
+    world:Text("----------------------------")
+    world:Spacing()
+    world:Toggle("opt_corpseesp", "Corpse ESP", false)
+    Notification.kbCorpse = world:Keybind("opt_corpseesp_kb", 0, "toggle")
+    world:SliderInt("corpseesp_range", "Corpse Range (studs)", 1, 1250, 500)
+    world:Spacing()
+    world:Text("------------------------------")
+    world:Text("Dropped Item Filters (on = hidden)")
+    for _, t in ipairs(CATEGORY_TOGGLES) do
+        world:Toggle(t.espId, t.label, t.espDefault)
+    end
 
     -- Settings: Performance Mode turns off the Hotbar fade and the notification slide
     local settings = tab:Section("Settings", "Left")
     settings:SliderFloat("ui_opacity", "UI Opacity", 0.3, 1.0, DEFAULT_OPACITY, "%.2f")
     settings:Toggle("opt_perf", "Performance Mode", false)
     settings:Tip("Disables the Hotbar fade and notification slide animations")
+
+    -- World Filter Text Colors: colour of the Dropped Item ESP text per item type
+    -- (toggle on = use that colour; off = default white, highlighted items pink)
+    settings:Spacing()
+    settings:Text("--------------------------------")
+    settings:Text("World Filter Text Colors")
+    settings:Toggle("wtc_armor", "Armor", true)
+    settings:ColorPicker("wtc_armor_col", 0.39, 0.63, 1.0, 1.0)
+    settings:Toggle("wtc_weapons", "Weapons", true)
+    settings:ColorPicker("wtc_weapons_col", 1.0, 0.39, 0.39, 1.0)
+    settings:Toggle("wtc_super", "Super Valuable", true)
+    settings:ColorPicker("wtc_super_col", 1.0, 0.08, 0.58, 1.0)
+    settings:Toggle("wtc_valuable", "Valuable", true)
+    settings:ColorPicker("wtc_valuable_col", 1.0, 0.84, 0.0, 1.0)
+    settings:Toggle("wtc_meds", "Medicals", true)
+    settings:ColorPicker("wtc_meds_col", 0.30, 0.90, 0.45, 1.0)
+    settings:Toggle("wtc_stims", "Stims", true)
+    settings:ColorPicker("wtc_stims_col", 0.20, 0.85, 1.0, 1.0)
+    settings:Toggle("wtc_corpse", "Corpse", true)
+    settings:ColorPicker("wtc_corpse_col", 0.75, 0.45, 1.0, 1.0)
 
     -- Right column: status, Inv Aim filters, then Debug Options at the bottom
     local status = tab:Section("Status", "Right")
@@ -698,6 +920,7 @@ UI.AddTab("FuzzyHook - PRIVATE", function(tab)
     iface:Button("Reset UI Positions", onResetClick)
     iface:Button("Test Notification", onTestNotifyClick)
     iface:Button("Hotbar Debug (prints)", onIconTestClick)
+    iface:Button("Dropped Item Debug (prints)", Notification.dropDebug)
     iface:Toggle("inv_showall", "Inv Aim: Show All (debug)", false)
     iface:Text("Drag a panel by its top bar")
 end)
@@ -3124,8 +3347,11 @@ do
     --   "MI-24" also matches "MI24". Only that one list is read, every BOSS_REFRESH
     --   seconds, and only while the toggle is on.
     ----------------------------------------------------------------------
-    local BOSS_NAMES = { "Whisper", "Death", "Dozer", "Anton", "BTR", "MI-24" }
-    local BOSS_FOLDERS = {}     -- extra Workspace folder names to look in, e.g. { "Bosses", "NPCs" }
+    local BOSS_NAMES = { "Whisper", "Death", "Dozer", "Anton", "BTR80", "MI-24" }
+    -- extra places to look in, as paths from Workspace written with "/" (a boss counts as available
+    -- while an object with its name exists directly inside that folder):
+    --   "AiZones/BTR"  ->  Workspace.AiZones.BTR.BTR80
+    local BOSS_FOLDERS = { "AiZones/BTR" }
     local BOSS_REFRESH = 3      -- seconds between scans
 
     local BOSS_W, BOSS_GAP = 200, 10   -- BOSS_GAP = px between this panel and Server Loot
@@ -3204,7 +3430,11 @@ do
         for i = 1, #BOSS_NAMES do found[i] = false end
         scanParent(Workspace)
         for i = 1, #BOSS_FOLDERS do
-            local f = Workspace:FindFirstChild(BOSS_FOLDERS[i])
+            local f = Workspace
+            for part in string.gmatch(BOSS_FOLDERS[i], "[^/]+") do
+                f = f:FindFirstChild(part)
+                if f == nil or f.Name == "Unreadable_name" then f = nil break end
+            end
             if f then scanParent(f) end
         end
     end
@@ -3353,6 +3583,638 @@ RunService.RenderStepped:Connect(function()
 end)
 
 ----------------------------------------------------------------------
+-- DROPPED ITEM ESP (World Toggles)
+-- Everything inside Workspace.DroppedItems (also inside its sub-folders) that is on the known
+-- item lists (weapons, equipment, rations, meds, stims, valuables) and within the
+-- "Range (studs)" slider gets its name + distance drawn at its position.
+-- Workspace.DroppedItems holds a HUGE number of objects, so:
+--   * it is only scanned once a second (and only while the toggle is on), not every frame
+--   * only the nearest ESP_MAX items are kept and drawn (text drawings are pooled)
+--   * each frame only those few are projected with WorldToScreen
+-- Corpse ESP: a Model in the same folder that is not a listed item but holds a Humanoid is a corpse.
+----------------------------------------------------------------------
+do
+    local ESP_MAX = 60           -- most items drawn at once (the nearest ones)
+    local ESP_SCAN_EVERY = 1     -- seconds between scans of Workspace.DroppedItems
+    local ESP_SCAN_CAP = 3000    -- safety cap on objects looked at per scan
+    local ESP_COLOR = Color3.fromRGB(255, 255, 255)
+    local ESP_OUTLINE = Color3.fromRGB(0, 0, 0)
+    local ESP_FONT = Drawing.Fonts.ProximaSoftBold  -- try Drawing.Fonts.SystemBold / Monospace / Pixel / Minecraft
+    local ESP_FONT_SIZE = 14
+
+    -- Every item keeps ITS OWN label (Text drawing) for as long as it stays in the results, so labels
+    -- never swap between items when the list is re-sorted (that swapping was the flicker).
+    local entries, entryCount = {}, 0   -- current labels: { part, name, dist, col, d (its Text drawing), addr, ... }
+    local byAddr = {}                   -- [instance Address] = entry
+    local freeDraw = {}                 -- spare Text drawings, reused instead of creating new ones
+    local shownCount = 0                -- how many labels are currently visible
+    local originPart = nil              -- your HumanoidRootPart (distances are refreshed from it every frame)
+    local lastOrigin = nil              -- your position at the last scan (fallback)
+
+    local espSize = ESP_FONT_SIZE      -- current label size (follows the "Item ESP Text Size" slider)
+
+    local function newText()
+        local d = freeDraw[#freeDraw]
+        if d then
+            freeDraw[#freeDraw] = nil
+            return d
+        end
+        d = Drawing.new("Text")
+        d.Font = ESP_FONT
+        d.Size = espSize
+        d.Center = true
+        d.Outline = true                      -- black stroke around the white text
+        pcall(function() d.OutlineColor = ESP_OUTLINE end)
+        d.Color = ESP_COLOR
+        d.Visible = false
+        return d
+    end
+
+    local function releaseEntry(e)
+        if e.vis then e.d.Visible = false end
+        e.vis = false
+        freeDraw[#freeDraw + 1] = e.d
+        e.d = nil
+        if e.addr then byAddr[e.addr] = nil end
+    end
+
+    local function clearEntries()
+        for i = 1, #entries do releaseEntry(entries[i]) end
+        entries, entryCount, shownCount = {}, 0, 0
+    end
+
+    -- Only items from the known lists (ITEM_LIST_TEXT) are drawn, matched by exact name ignoring
+    -- capitalisation. The "Filter <category>" toggles under World Toggles decide which categories are
+    -- hidden (same categories as the Inv Aim filters). An item that is in several categories stays
+    -- visible while at least one of them is not filtered. Corpses / junk never match the lists.
+    local espCats = {}    -- [lowercase item name] = { category, ... }
+    for itemName, cats in pairs(ITEM_CATEGORIES) do
+        espCats[string.lower(itemName)] = cats
+    end
+    local espHidden = {}  -- [category] = true while its filter is on (re-read at every scan)
+
+    local function espShown(lowerName)
+        local cats = espCats[lowerName]
+        if not cats then return false end
+        for i = 1, #cats do
+            if not espHidden[cats[i]] then return true end
+        end
+        return false
+    end
+
+    -- World Filter Text Colors (Settings section) - Dropped Item ESP only.
+    -- Each colour group has its OWN explicit item list (names separated by spaces / commas / lines).
+    -- Priority when an item is in several groups: Super Valuable, Valuable, Weapons, Armor.
+    local WTC = {
+        { cat = "Super Valuable", on = "wtc_super",    col = "wtc_super_col", def = { 1.0, 0.08, 0.58 }, items = [[
+            CatToken GoldenTicket R700 FlareGun HSPV IOTV4 TFZ98S PEQ15 SOCOM556 Reapir
+            Mag556Rnd100 Mag556Round100 ThermalModule 338AP ]] },
+        { cat = "Valuable",       on = "wtc_valuable", col = "wtc_valuable_col", def = { 1.0, 0.84, 0.0 }, items = [[
+            GPU Gold50g WhisperPlush InflatedCrown WeddingRing MikeShades EnzoPlush DozerPlush DozerArmor
+            AntonPlush GoldenMakarov GoldSkull GoldWatch PortableConsole Rubles SolterStatue SPSh44 JPC ]] },
+        { cat = "Weapons",        on = "wtc_weapons",  col = "wtc_weapons_col", def = { 1.0, 0.39, 0.39 }, items = [[
+            ADAR15 AKM AKMN AsVal FAL Groza IZh12 IZh81 M4 MK23 Makarov Mosin MP443 MP5SD NagantRevolver
+            PKM PPSH41 R700 RPG7 SKS SVD Saiga12 TFZ0 TFZ98S TOZ106 TT33 VZ61
+            F1 Fuze M84 RGD5 RGO MON50 PMN2 Snowball ]] },
+        { cat = "Armor",          on = "wtc_armor",    col = "wtc_armor_col", def = { 0.39, 0.63, 1.0 }, items = [[
+            6B2 6B23 6B27 6B43 6B47 6B5 Altyn AltynVisor ConcealedVest DozerArmor FastMT FastVisor
+            HSPV IOTV4 JPC LegArmor Lvl4Plate MaskaVisor MotorcycleHelmet MotorcycleHelmetVisor LowCutVisor
+            Pantsir3 SSH68 ScavKingHelmet ScavKingVest Smersh TitanShield UNOHelmet UNOVest ZSh ZShVisor
+            Balaclava CamoPants CamoShirt CivilianPants CivilianShirt CombatGloves GhillieHood GhillieLegs
+            GhillieTorso GorkaPants GorkaShirt GP5 HandWraps KneePads SewnMask SummerPants SummerShirt
+            WastelandPants WastelandShirt SantaHat TankCap Bandoiler SpecopsBackpack WastelandBackpack ]] },
+        { cat = "Corpse",         on = "wtc_corpse",   col = "wtc_corpse_col", def = { 0.75, 0.45, 1.0 }, items = "" },
+        { cat = "Medicals",       on = "wtc_meds",     col = "wtc_meds_col", def = { 0.30, 0.90, 0.45 }, items = [[
+            AI2 AI4 AA2 Bandage WoundDressing Defibrillator Rags ]] },
+        { cat = "Stims",          on = "wtc_stims",    col = "wtc_stims_col", def = { 0.20, 0.85, 1.0 }, items = [[
+            SerumRed SerumGreen SerumYellow SerumPurple ]] },
+    }
+    -- built once: WTC[i].set[lowercase item name] = true
+    for i = 1, #WTC do
+        local set = {}
+        for nm in string.gmatch(WTC[i].items, "[^%s,]+") do
+            set[string.lower(nm)] = true
+        end
+        WTC[i].set = set
+        WTC[i].items = nil
+    end
+    local wtcColor = {}   -- [category] = Color3 while that group's custom colour is on (re-read at every scan)
+
+    -- Turns whatever UI.GetValue returned for a colour picker into a Color3 (or nil). It is not known
+    -- whether Matcha returns a Color3, a table, or separate r, g, b, a numbers, so all are handled.
+    local function toColor(r)
+        local v = r[1]
+        if typeof(v) == "Color3" then return v end
+        local R, G, B
+        if type(v) == "number" then
+            R, G, B = v, r[2], r[3]
+        elseif type(v) == "table" then
+            R, G, B = v.R or v.r or v[1], v.G or v.g or v[2], v.B or v.b or v[3]
+        end
+        if type(R) == "number" and type(G) == "number" and type(B) == "number" then
+            if R > 1 or G > 1 or B > 1 then return Color3.fromRGB(R, G, B) end -- 0..255 values
+            return Color3.new(R, G, B)                                         -- 0..1 values
+        end
+        return nil
+    end
+
+    local function readWtc()
+        for i = 1, #WTC do
+            local w = WTC[i]
+            local c = nil
+            if UI.GetValue(w.on) == true then
+                c = toColor({ UI.GetValue(w.col) })
+                if not c then c = Color3.new(w.def[1], w.def[2], w.def[3]) end -- could not read the picker: group default
+            end
+            wtcColor[w.cat] = c
+        end
+    end
+
+    -- custom colour of an item (nil = use the default white / highlight pink)
+    local function pickColor(lowerName)
+        for i = 1, #WTC do
+            local w = WTC[i]
+            local c = wtcColor[w.cat]
+            if c and w.set[lowerName] then return c end
+        end
+        return nil
+    end
+
+    local function readEspFilters()
+        for i = 1, #CATEGORY_TOGGLES do
+            local t = CATEGORY_TOGGLES[i]
+            espHidden[t.cat] = UI.GetValue(t.espId) == true
+        end
+        readWtc()
+    end
+
+    -- Finds the part that gives a dropped item its position. Matcha returns an invalid placeholder
+    -- (named "Unreadable_name") instead of nil for things that are not there, e.g. Model.PrimaryPart
+    -- when it is not set, so every candidate is checked with valid() before it is used.
+    local function valid(i)
+        return i ~= nil and i.Name ~= "Unreadable_name" and i.Name ~= ""
+    end
+
+    -- Matcha's IsA("BasePart") answers true for a Model too, so parts are recognised by ClassName.
+    local PART_CLASS = {
+        Part = true, MeshPart = true, UnionOperation = true, WedgePart = true,
+        CornerWedgePart = true, TrussPart = true, SpawnLocation = true, Seat = true,
+    }
+
+    local function findPart(obj, cls)
+        if PART_CLASS[cls] then return obj end
+
+        -- 1) DroppedItems.<item>.Part
+        local p = obj:FindFirstChild("Part")
+        if valid(p) and PART_CLASS[p.ClassName] then return p end
+
+        -- 2) any part directly inside the item
+        local kids = obj:GetChildren()
+        for i = 1, #kids do
+            if PART_CLASS[kids[i].ClassName] then return kids[i] end
+        end
+
+        -- 3) one level deeper (e.g. an inner Model holding the MeshPart)
+        for i = 1, #kids do
+            if kids[i].ClassName == "Model" then
+                local sub = kids[i]:GetChildren()
+                for j = 1, #sub do
+                    if PART_CLASS[sub[j].ClassName] then return sub[j] end
+                end
+            end
+        end
+
+        -- 4) the model's PrimaryPart, last (may be an invalid placeholder)
+        if cls == "Model" then
+            p = obj.PrimaryPart
+            if valid(p) and PART_CLASS[p.ClassName] then return p end
+        end
+        return nil
+    end
+
+    -- Where distances are measured from: your character first, then the camera (the camera's
+    -- CFrame.Position came back nil in Matcha, which broke the distance maths). Returns the point
+    -- and the name of the source it came from.
+    local function getOrigin()
+        local pos
+        pcall(function()
+            local char = Players.LocalPlayer.Character
+            local hrp = char and char:FindFirstChild("HumanoidRootPart")
+            pos = hrp and hrp.Position
+        end)
+        if pos then return pos, "HumanoidRootPart" end
+        pcall(function() pos = Workspace.CurrentCamera.Position end)
+        if pos then return pos, "Camera.Position" end
+        pcall(function() pos = Workspace.CurrentCamera.CFrame.Position end)
+        if pos then return pos, "Camera.CFrame.Position" end
+        return nil, "none"
+    end
+
+    -- Corpse detection helpers (kept in one table to save local variables).
+    local CP = { no = {}, scan = 0, recheck = 10 }
+    -- true when the object has a Humanoid child (matched by class or by name; GetChildren is used
+    -- because it is known to work in Matcha)
+    CP.hasHum = function(obj)
+        local kids = obj:GetChildren()
+        for i = 1, #kids do
+            local k = kids[i]
+            if k.ClassName == "Humanoid" or k.Name == "Humanoid" then return true end
+        end
+        return false
+    end
+
+    -- Dropped objects can sit directly in the folder or inside sub-folders of it (like the example
+    -- script handles), so folders are walked into (max 2 levels). Models give their position through
+    -- PrimaryPart / first BasePart; a loose part uses its own position.
+    local function collect(parent, depth, found, origin, range, state)
+        local kids = parent:GetChildren()
+        for i = 1, #kids do
+            if state.n >= ESP_SCAN_CAP then return end
+            state.n = state.n + 1
+            local obj = kids[i]
+            local cls = obj.ClassName
+            if state.items and espShown(string.lower(obj.Name)) then
+                -- the item itself (whatever class it is, e.g. DroppedItems.Pantsir3 with a child "Part")
+                local part = findPart(obj, cls)
+                local pp = part and part.Position
+                if pp then
+                    local dist = (pp - origin).Magnitude
+                    if dist <= range then
+                        found[#found + 1] = { part = part, name = obj.Name, dist = dist,
+                            col = pickColor(string.lower(obj.Name)), addr = obj.Address }
+                    end
+                end
+            elseif cls == "Folder" then
+                if depth < 2 then collect(obj, depth + 1, found, origin, range, state) end
+            elseif state.corpses and cls == "Model" then
+                -- a Model that is not a listed item but contains a Humanoid is a corpse. Models
+                -- without one are remembered for CP.recheck scans so the (huge) pile of junk is not
+                -- re-inspected every second.
+                local addr = obj.Address
+                local lastNo = addr and CP.no[addr]
+                if not (lastNo and state.scan - lastNo < CP.recheck) then
+                    if CP.hasHum(obj) then
+                        local part = findPart(obj, cls)
+                        local pp = part and part.Position
+                        if pp then
+                            local dist = (pp - origin).Magnitude
+                            if dist <= state.crange then
+                                state.corpses[#state.corpses + 1] = { part = part, name = "[Corpse] " .. obj.Name,
+                                    dist = dist, col = wtcColor["Corpse"], addr = addr, corpse = true }
+                            end
+                        end
+                    elseif addr then
+                        CP.no[addr] = state.scan
+                    end
+                end
+            end
+        end
+    end
+
+    -- The ESP is active while its toggle is ON and its keybind is active. A keybind has its own state
+    -- (UI.GetValue does not return it), read from the widget: with no key assigned (0) the toggle alone
+    -- decides; with a key assigned, the key's mode (toggle / hold / always / click) decides.
+    local function kbCheck() -- (a named function: pcall(kbCheck) allocates nothing, this runs every frame)
+        local kb = Notification.kbDrop
+        local key = kb:GetKey()
+        if key ~= nil and key ~= 0 then return kb:IsEnabled() == true end
+        return true
+    end
+
+    local function espActive()
+        if UI.GetValue("opt_dropesp") ~= true then return false end
+        if not Notification.kbDrop then return true end
+        local ok, on = pcall(kbCheck)
+        if not ok then return true end -- could not read the keybind: the toggle alone decides
+        return on
+    end
+
+    -- Corpse ESP: toggle "opt_corpseesp" + its own keybind (Notification.kbCorpse), same rules as above
+    local function corpseKb()
+        local kb = Notification.kbCorpse
+        local key = kb:GetKey()
+        if key ~= nil and key ~= 0 then return kb:IsEnabled() == true end
+        return true
+    end
+
+    local function corpseActive()
+        if UI.GetValue("opt_corpseesp") ~= true then return false end
+        if not Notification.kbCorpse then return true end
+        local ok, on = pcall(corpseKb)
+        if not ok then return true end
+        return on
+    end
+
+    local function scanDropped()
+        local root = Workspace:FindFirstChild("DroppedItems")
+            or Workspace:FindFirstChild("RuntimeItems")
+            or Workspace:FindFirstChild("Drops")
+        if not root then
+            if entryCount > 0 then clearEntries() end
+            return
+        end
+
+        local origin = getOrigin()
+        if not origin then return end -- keep the old labels instead of wiping them
+        lastOrigin = origin
+        readEspFilters()
+        local char = Players.LocalPlayer.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        originPart = valid(hrp) and hrp or nil
+        local range = UI.GetValue("dropesp_range") or 500
+
+        -- items and corpses are found in the SAME walk of the folder
+        local itemOn, corpseOn = espActive(), corpseActive()
+        CP.scan = CP.scan + 1
+        if CP.scan % 120 == 0 then CP.no = {} end -- forget old "not a corpse" notes now and then
+        local found = {}
+        local state = { n = 0, items = itemOn, scan = CP.scan }
+        if corpseOn then
+            state.corpses = {}
+            state.crange = UI.GetValue("corpseesp_range") or 500
+        end
+        collect(root, 1, found, origin, range, state)
+
+        table.sort(found, function(a, b) return a.dist < b.dist end)
+        local n = (#found < ESP_MAX) and #found or ESP_MAX
+        if state.corpses then
+            local cs = state.corpses
+            table.sort(cs, function(a, b) return a.dist < b.dist end)
+            for i = n + 1, #found do found[i] = nil end -- keep only the nearest ESP_MAX items
+            for i = 1, (#cs < ESP_MAX) and #cs or ESP_MAX do
+                found[#found + 1] = cs[i]
+            end
+            n = #found
+        end
+
+        -- match the new results to the existing labels by instance Address
+        local newList, seen = {}, {}
+        for i = 1, n do
+            local f = found[i]
+            local addr = f.addr
+            local e = addr and byAddr[addr]
+            if e then
+                e.part, e.dist, e.name, e.col = f.part, f.dist, f.name, f.col
+                e.colSet = false -- colour settings may have changed: write it again once
+                e.gone = 0
+            else
+                e = f
+                e.d = newText()
+                e.vis, e.off, e.gone = false, 0, 0
+                if addr then byAddr[addr] = e end
+            end
+            if addr then seen[addr] = true end
+            newList[#newList + 1] = e
+        end
+
+        -- items missing from the results: kept for one more scan (so a single missed scan does not
+        -- make a label blink), then freed
+        for i = 1, #entries do
+            local e = entries[i]
+            if not (e.addr and seen[e.addr]) then
+                e.gone = (e.gone or 0) + 1
+                if e.gone <= 1 then
+                    newList[#newList + 1] = e
+                else
+                    releaseEntry(e)
+                end
+            end
+        end
+
+        entries = newList -- swapped in one step: the renderer never sees a half-built list
+        entryCount = #newList
+    end
+
+    -- Smoothness: distances come from your live position EVERY frame, a label is only written to when
+    -- its text / colour / visibility actually changed, positions are rounded to whole pixels, and a
+    -- label that is briefly unreadable or off screen for 1-2 frames keeps showing at its last spot
+    -- instead of blinking.
+    local function espRender()
+        local itemOn, corpseOn = espActive(), corpseActive()
+        if entryCount > 0 and not itemOn and not corpseOn then
+            clearEntries() -- turned off (toggle or keybind): hide every label immediately
+            return
+        end
+
+        -- "Item ESP Text Size" slider: applied to every label (and the spare ones) only when it changes
+        local sz = UI.GetValue("dropesp_textsize")
+        if type(sz) == "number" and sz ~= espSize then
+            espSize = sz
+            for i = 1, #entries do entries[i].d.Size = sz end
+            for i = 1, #freeDraw do freeDraw[i].Size = sz end
+        end
+
+        local n = entryCount
+        if n == 0 then return end
+
+        local opos = lastOrigin
+        local op = originPart
+        if op then
+            local pp = op.Position
+            if pp then opos = pp end
+        end
+
+        local used = 0
+        for i = 1, n do
+            local e = entries[i]
+            local d = e.d
+            local show = false
+
+            local part = e.part
+            local pp = part and part.Position
+            -- a kind that was just switched off stays hidden until the next scan frees its labels
+            if pp and (e.corpse and corpseOn or (not e.corpse and itemOn)) then
+                local pos, onScreen = WorldToScreen(pp)
+                if onScreen then
+                    show = true
+                    e.off = 0
+
+                    local dist = opos and (pp - opos).Magnitude or e.dist
+                    local di = math.floor(dist)
+                    if e.di ~= di then
+                        e.di = di
+                        e.txt = e.name .. " [" .. di .. "]"
+                    end
+                    if e.shownTxt ~= e.txt then
+                        e.shownTxt = e.txt
+                        d.Text = e.txt
+                    end
+
+                    -- colour is written once per entry: custom type colour, else deep pink for
+                    -- highlighted items, else white
+                    if not e.colSet then
+                        e.colSet = true
+                        d.Color = e.col or (HIGHLIGHT[e.name] == true and HIGHLIGHT_COLOR or ESP_COLOR)
+                    end
+
+                    d.Position = Vector2.new(math.floor(pos.X + 0.5), math.floor(pos.Y - 7 + 0.5))
+                end
+            end
+
+            if not show then
+                local off = (e.off or 0) + 1
+                e.off = off
+                if off <= 2 and e.vis then show = true end -- short grace period: keep the last position
+            end
+
+            if show then used = used + 1 end
+            if e.vis ~= show then
+                e.vis = show
+                d.Visible = show
+            end
+        end
+        shownCount = used
+    end
+
+    -- "Dropped Item Debug (prints)" button (Debug Options). Prints what the ESP sees so it is easy to
+    -- find out why an item is not drawn. Stored on the Notification table so it needs no extra local.
+    Notification.dropDebug = function()
+        local ok, err = pcall(function()
+            print("[Drop debug] toggle opt_dropesp = " .. tostring(UI.GetValue("opt_dropesp"))
+                .. " | keybind: " .. (function()
+                    local kb = Notification.kbDrop
+                    if not kb then return "widget not available" end
+                    local ok, r = pcall(function() return "key=" .. tostring(kb:GetKey()) .. " mode=" .. tostring(kb:GetType()) .. " active=" .. tostring(kb:IsEnabled()) end)
+                    return ok and r or ("error: " .. tostring(r))
+                end)()
+                .. " | ESP active = " .. tostring(espActive())
+                .. " | range = " .. tostring(UI.GetValue("dropesp_range")))
+
+            local root, rootName = nil, "none"
+            local names = { "DroppedItems", "RuntimeItems", "Drops" }
+            for i = 1, #names do
+                local r = Workspace:FindFirstChild(names[i])
+                if r then root, rootName = r, names[i] break end
+            end
+            if not root then
+                print("[Drop debug] no DroppedItems / RuntimeItems / Drops folder found in Workspace")
+                return
+            end
+            local kids = root:GetChildren()
+            print("[Drop debug] root: Workspace." .. rootName .. " [" .. root.ClassName .. "], direct children: " .. #kids)
+
+            local origin, originSrc = getOrigin()
+            readEspFilters()
+            do
+                local r = { UI.GetValue("wtc_armor_col") }
+                local parts = {}
+                for i = 1, 4 do parts[i] = typeof(r[i]) .. "=" .. tostring(r[i]) end
+                print("[Drop debug] armor colour picker returns: " .. table.concat(parts, ", ")
+                    .. " | toggle wtc_armor = " .. tostring(UI.GetValue("wtc_armor")))
+                print("[Drop debug] custom colours active (armor/weapons/super/valuable): "
+                    .. tostring(wtcColor["Armor"] ~= nil) .. "/" .. tostring(wtcColor["Weapons"] ~= nil) .. "/"
+                    .. tostring(wtcColor["Super Valuable"] ~= nil) .. "/" .. tostring(wtcColor["Valuable"] ~= nil))
+            end
+            print("[Drop debug] distance origin: " .. originSrc .. " = " .. tostring(origin))
+            if not origin then
+                print("[Drop debug] could not read your position (character and camera both nil)")
+                return
+            end
+            local range = UI.GetValue("dropesp_range") or 500
+            readEspFilters()
+            local st = { n = 0, folders = 0, matched = 0, inrange = 0, other = 0, samples = {}, skipped = {},
+                models = 0, corpses = 0, csamples = {} }
+
+            local function walk(parent, depth)
+                local list = parent:GetChildren()
+                for i = 1, #list do
+                    if st.n >= ESP_SCAN_CAP then return end
+                    st.n = st.n + 1
+                    local obj = list[i]
+                    local cls = obj.ClassName
+                    if espShown(string.lower(obj.Name)) then
+                        st.matched = st.matched + 1
+                        local part = findPart(obj, cls)
+                        local info = obj.Name .. " [" .. cls .. "]"
+                        local pp = part and part.Position
+                        if part and not pp then
+                            info = info .. " part=" .. part.Name .. " [" .. part.ClassName .. "] POSITION IS NIL"
+                        elseif part then
+                            local dist = (pp - origin).Magnitude
+                            info = info .. " part=" .. part.Name .. " [" .. part.ClassName .. "] dist=" .. math.floor(dist)
+                            if dist <= range then
+                                st.inrange = st.inrange + 1
+                            else
+                                info = info .. " (OUT OF RANGE)"
+                            end
+                        else
+                            info = info .. " NO PART FOUND"
+                        end
+                        if #st.samples < 12 then st.samples[#st.samples + 1] = info end
+                    elseif cls == "Folder" then
+                        st.folders = st.folders + 1
+                        if depth < 2 then walk(obj, depth + 1) end
+                    else
+                        st.other = st.other + 1
+                        if cls == "Model" and st.models < 400 then
+                            st.models = st.models + 1
+                            if CP.hasHum(obj) then
+                                st.corpses = st.corpses + 1
+                                if #st.csamples < 8 then
+                                    local part = findPart(obj, cls)
+                                    local pp = part and part.Position
+                                    st.csamples[#st.csamples + 1] = obj.Name .. (part and (" part=" .. part.Name
+                                        .. " [" .. part.ClassName .. "]" .. (pp and (" dist=" .. math.floor((pp - origin).Magnitude)) or " POSITION NIL"))
+                                        or " NO PART FOUND")
+                                end
+                            end
+                        end
+                        if #st.skipped < 12 then st.skipped[#st.skipped + 1] = obj.Name .. " [" .. cls .. "]" end
+                    end
+                end
+            end
+            walk(root, 1)
+
+            print("[Drop debug] visited " .. st.n .. " objects | folders: " .. st.folders
+                .. " | on the item lists: " .. st.matched .. " | in range: " .. st.inrange
+                .. " | not on the lists: " .. st.other)
+            for i = 1, #st.samples do print("[Drop debug] match: " .. st.samples[i]) end
+            if st.matched == 0 then
+                print("[Drop debug] nothing matched the lists. Examples of what was skipped (name [class]):")
+                for i = 1, #st.skipped do print("[Drop debug]   skipped: " .. st.skipped[i]) end
+            end
+            print("[Drop debug] corpse check: Models inspected = " .. st.models .. " | with a Humanoid (corpses) = " .. st.corpses
+                .. " | Corpse ESP active = " .. tostring(corpseActive()) .. " | corpse range = " .. tostring(UI.GetValue("corpseesp_range")))
+            for i = 1, #st.csamples do print("[Drop debug] corpse: " .. st.csamples[i]) end
+            if st.corpses == 0 and st.models > 0 then
+                print("[Drop debug] no Model had a Humanoid child; if corpses look different (e.g. no Humanoid), send me the corpse's children")
+            end
+            print("[Drop debug] ESP state: scanned entries = " .. entryCount .. ", drawn on screen = " .. shownCount)
+            if entryCount > 0 then
+                local e = entries[1]
+                local pos, on = WorldToScreen(e.part.Position)
+                print("[Drop debug] nearest entry: " .. e.name .. " dist=" .. math.floor(e.dist)
+                    .. " screen=(" .. math.floor(pos.X) .. ", " .. math.floor(pos.Y) .. ") onScreen=" .. tostring(on))
+            end
+            print("[Drop debug] done")
+        end)
+        if not ok then print("[Drop debug] error: " .. tostring(err)) end
+    end
+
+    RunService.RenderStepped:Connect(function()
+        guarded(espRender)
+    end)
+
+    local wasActive, lastScanAt = false, 0
+    task.spawn(function()
+        while true do
+            local active = espActive() or corpseActive()
+            if active then
+                local now = tick()
+                if not wasActive or now - lastScanAt >= ESP_SCAN_EVERY then
+                    lastScanAt = now
+                    guarded(scanDropped)
+                end
+            elseif entryCount > 0 then
+                clearEntries() -- off: hide and free every label
+            end
+            wasActive = active
+            wait(0.1)
+        end
+    end)
+end
+
+----------------------------------------------------------------------
 -- LOAD CHECK
 -- The one and only console line. It waits 2 seconds so every background loop
 -- has run at least once, then prints only if all panels were created, the
@@ -3365,6 +4227,6 @@ task.spawn(function()
         and getPlayersFolder() ~= nil
         and loadErrors == 0
     if allGood then
-        print("FuzzyHook - PRIVATE has loaded without any errors")
+        print("FuzzyHook - DEV has loaded without any errors MAY be unstable | updated last 10/29/2026")
     end
 end)
