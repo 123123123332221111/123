@@ -846,7 +846,7 @@ end
 -- If the menu font cannot draw the emoji and shows boxes / "?", swap them for "/!\" here.
 local DEBUG_TITLE = "\u{26A0}\u{FE0F} Debug Options \u{26A0}\u{FE0F}"
 
-UI.AddTab("FuzzyHook - PRIVATE", function(tab)
+UI.AddTab("FuzzyHook - DEV", function(tab)
     -- Left column: toggles
     addToggleSection(tab, "Important Toggles", "Left", IMPORTANT_TOGGLES)
     addToggleSection(tab, "Server Toggles", "Left", SERVER_TOGGLES)
