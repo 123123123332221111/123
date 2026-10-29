@@ -809,6 +809,7 @@ local function addToggleSection(tab, title, side, list)
         local t = list[i]
         sec:Toggle(t.id, t.label, t.default, t.cb)
     end
+    return sec
 end
 
 -- "Print Most Wanted" button: only scans ReplicatedStorage.ReportList.MostWanted when clicked.
@@ -846,73 +847,67 @@ end
 -- If the menu font cannot draw the emoji and shows boxes / "?", swap them for "/!\" here.
 local DEBUG_TITLE = "\u{26A0}\u{FE0F} Debug Options \u{26A0}\u{FE0F}"
 
-UI.AddTab("FuzzyHook - DEV", function(tab)
+UI.AddTab("FuzzyHook - dev build", function(tab)
     -- Left column: toggles
-    addToggleSection(tab, "Important Toggles", "Left", IMPORTANT_TOGGLES)
+    local important = addToggleSection(tab, "Important Toggles", "Left", IMPORTANT_TOGGLES)
+    important:Text(reportLabel)
+    important:Button("Print Most Wanted", onMostWantedClick)
     addToggleSection(tab, "Server Toggles", "Left", SERVER_TOGGLES)
+    -- Inventory Toggles
     addToggleSection(tab, "Inventory Toggles", "Left", INVENTORY_TOGGLES)
 
-    -- World Toggles: Dropped Item ESP (toggle + keybind + range + text size), Corpse ESP (toggle +
-    -- keybind + range; no functionality yet), then the Dropped Item filters.
-    -- Matcha has no divider widget, so the dividers are dashed text lines.
+    -- World Toggles: Dropped Item ESP (toggle + keybind + range), Corpse ESP (toggle + keybind + range)
     local world = tab:Section("World Toggles", "Left")
     world:Toggle("opt_dropesp", "Dropped Item ESP", false)
     Notification.kbDrop = world:Keybind("opt_dropesp_kb", 0, "toggle") -- unbound by default: click it in the menu to pick a key
     world:SliderInt("dropesp_range", "Range (studs)", 1, 1000, 500)
-    world:SliderInt("dropesp_textsize", "Item ESP Text Size", 8, 30, 14)
-    world:Spacing()
-    world:Text("----------------------------")
     world:Spacing()
     world:Toggle("opt_corpseesp", "Corpse ESP", false)
     Notification.kbCorpse = world:Keybind("opt_corpseesp_kb", 0, "toggle")
     world:SliderInt("corpseesp_range", "Corpse Range (studs)", 1, 1250, 500)
-    world:Spacing()
-    world:Text("------------------------------")
-    world:Text("Dropped Item Filters (on = hidden)")
-    for _, t in ipairs(CATEGORY_TOGGLES) do
-        world:Toggle(t.espId, t.label, t.espDefault)
-    end
 
     -- Settings: Performance Mode turns off the Hotbar fade and the notification slide
     local settings = tab:Section("Settings", "Left")
     settings:SliderFloat("ui_opacity", "UI Opacity", 0.3, 1.0, DEFAULT_OPACITY, "%.2f")
+    settings:SliderInt("dropesp_textsize", "Item ESP Text Size", 8, 30, 14)
     settings:Toggle("opt_perf", "Performance Mode", false)
+    settings:Toggle("opt_icons_off", "Disable Icon Loading", false)
+    settings:Tip("If enabled disable loading the icons from the github repo for performance, re enable if you want icons again")
     settings:Tip("Disables the Hotbar fade and notification slide animations")
+
+    -- Right column: every filter / colour picker in its own section, then Debug Options at the bottom.
+    -- Scrollable sections do not draw their own name, so the title is a text line.
+    local invFilter = tab:Section("Item Filter", "Right", {"Categories"}, 300)
+    invFilter:Text("Item Filter (Inv Aim, on = hidden)")
+    invFilter:Spacing()
+    for _, t in ipairs(CATEGORY_TOGGLES) do
+        invFilter:Toggle(t.id, t.label, false, t.cb)
+    end
+
+    local espFilter = tab:Section("Item ESP Filter", "Right", {"Categories"}, 300)
+    espFilter:Text("Item ESP Filter (on = hidden)")
+    espFilter:Spacing()
+    for _, t in ipairs(CATEGORY_TOGGLES) do
+        espFilter:Toggle(t.espId, t.label, t.espDefault)
+    end
 
     -- World Filter Text Colors: colour of the Dropped Item ESP text per item type
     -- (toggle on = use that colour; off = default white, highlighted items pink)
-    settings:Spacing()
-    settings:Text("--------------------------------")
-    settings:Text("World Filter Text Colors")
-    settings:Toggle("wtc_armor", "Armor", true)
-    settings:ColorPicker("wtc_armor_col", 0.39, 0.63, 1.0, 1.0)
-    settings:Toggle("wtc_weapons", "Weapons", true)
-    settings:ColorPicker("wtc_weapons_col", 1.0, 0.39, 0.39, 1.0)
-    settings:Toggle("wtc_super", "Super Valuable", true)
-    settings:ColorPicker("wtc_super_col", 1.0, 0.08, 0.58, 1.0)
-    settings:Toggle("wtc_valuable", "Valuable", true)
-    settings:ColorPicker("wtc_valuable_col", 1.0, 0.84, 0.0, 1.0)
-    settings:Toggle("wtc_meds", "Medicals", true)
-    settings:ColorPicker("wtc_meds_col", 0.30, 0.90, 0.45, 1.0)
-    settings:Toggle("wtc_stims", "Stims", true)
-    settings:ColorPicker("wtc_stims_col", 0.20, 0.85, 1.0, 1.0)
-    settings:Toggle("wtc_corpse", "Corpse", true)
-    settings:ColorPicker("wtc_corpse_col", 0.75, 0.45, 1.0, 1.0)
-
-    -- Right column: status, Inv Aim filters, then Debug Options at the bottom
-    local status = tab:Section("Status", "Right")
-    status:Text(reportLabel)
-
-    local wanted = tab:Section("Most Wanted", "Right")
-    wanted:Button("Print Most Wanted", onMostWantedClick)
-
-    -- Inv Aim filters: one toggle per category (hides its items and everything inside them)
-    local filters = tab:Section("Item Filter", "Right", {"Categories"}, 300)
-    filters:Text("Item Filter") -- the tabbed section does not draw its own name, so the title is a text line
-    filters:Spacing()
-    for _, t in ipairs(CATEGORY_TOGGLES) do
-        filters:Toggle(t.id, t.label, false, t.cb)
-    end
+    local colors = tab:Section("World Filter Text Colors", "Right")
+    colors:Toggle("wtc_armor", "Armor", true)
+    colors:ColorPicker("wtc_armor_col", 0.39, 0.63, 1.0, 1.0)
+    colors:Toggle("wtc_weapons", "Weapons", true)
+    colors:ColorPicker("wtc_weapons_col", 1.0, 0.39, 0.39, 1.0)
+    colors:Toggle("wtc_super", "Super Valuable", true)
+    colors:ColorPicker("wtc_super_col", 1.0, 0.08, 0.58, 1.0)
+    colors:Toggle("wtc_valuable", "Valuable", true)
+    colors:ColorPicker("wtc_valuable_col", 1.0, 0.84, 0.0, 1.0)
+    colors:Toggle("wtc_meds", "Medicals", true)
+    colors:ColorPicker("wtc_meds_col", 0.30, 0.90, 0.45, 1.0)
+    colors:Toggle("wtc_stims", "Stims", true)
+    colors:ColorPicker("wtc_stims_col", 0.20, 0.85, 1.0, 1.0)
+    colors:Toggle("wtc_corpse", "Corpse", true)
+    colors:ColorPicker("wtc_corpse_col", 0.75, 0.45, 1.0, 1.0)
 
     -- Debug Options (same widgets / ids as the old "Interface" section, so saved values keep working)
     local iface = tab:Section(DEBUG_TITLE, "Right")
@@ -1701,6 +1696,7 @@ do
     end
 
     local function requestImage(item)
+        if UI.GetValue("opt_icons_off") == true then return end -- Settings: "Disable Icon Loading" is on
         local st = imgState[item]
         if st == "ok" or st == "loading" then return end
         if st == "fail" and tick() - imgFailAt[item] < IMG_RETRY then return end
@@ -1733,7 +1729,12 @@ do
     task.spawn(function()
         while true do
             local item = table.remove(imgQueue, 1)
-            if item then
+            if item and UI.GetValue("opt_icons_off") == true then
+                -- switched off while items were waiting: drop them without any download
+                imgState[item] = nil
+                item = nil
+                wait(0.25)
+            elseif item then
                 local data, why = tryDownload(item)
                 if not data and IMG_ALIAS[item] then
                     local d2, w2 = tryDownload(IMG_ALIAS[item])
@@ -2147,7 +2148,8 @@ do
         t.bg.d.Color = HIGHLIGHT[item] and HL_TILE or TILE_BG
         t.stroke.d.Color = isEq and EQUIPPED_STROKE or STROKE_COLOR
         t.stroke.d.Thickness = isEq and EQUIPPED_THICKNESS or 1
-        if imgState[item] == "ok" then
+        local iconsOn = UI.GetValue("opt_icons_off") ~= true
+        if iconsOn and imgState[item] == "ok" then
             t.img.d.Data = imgData[item]
             t.hasImg = true
         else
@@ -2160,7 +2162,7 @@ do
         if sub and sub ~= "" then
             for nm in string.gmatch(sub, "[^,]+") do
                 if ns >= #t.subs then break end
-                if imgState[nm] == "ok" then
+                if iconsOn and imgState[nm] == "ok" then
                     ns = ns + 1
                     t.subs[ns].img.d.Data = imgData[nm]
                 end
@@ -2451,6 +2453,14 @@ do
     function hotbarStep(target, now, wantTeams, wantAtt)
         if not hbOK then return end
         local dirty = false
+
+        -- "Disable Icon Loading" flipped: re-apply every tile at once (icons vanish / come back from the
+        -- cache, nothing is downloaded again for icons that already loaded)
+        local iconsOff = UI.GetValue("opt_icons_off") == true
+        if hbPanel.icoOff ~= iconsOff then
+            hbPanel.icoOff = iconsOff
+            imgDirty = true
+        end
 
         local wantTeamRow = (wantTeams and target ~= nil) and true or false
         if target == nil and hbPanel.fa > 0 then wantTeamRow = teamOn end -- keep the team card while fading out
