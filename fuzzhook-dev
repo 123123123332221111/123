@@ -1,4 +1,4 @@
--- Matcha LuaVM: FuzzyHook - dev build (draggable + transparent UI, equipment Hotbar)
+-- Matcha LuaVM: FuzzyHook - PRIVATE (draggable + transparent UI, equipment Hotbar)
 -- Notes:
 --  * UI.AddTab's callback runs every frame, so it only reads pre-built data
 --    (no closures / string building inside it).
@@ -43,15 +43,37 @@ end
 
 -- Counts errors caught while the script runs; the final "loaded" line needs this to be 0.
 local loadErrors = 0
-local function guarded(fn)
+-- PERFORMANCE PROFILER (Debug Options > "Performance Profiler" + "Performance Report (prints)").
+-- Off by default. While off, guarded() costs one table lookup extra and nothing is recorded.
+-- While on, every named guarded() call / timed section adds its run time to FZPROF.s[name].
+-- (a global table on purpose: it needs no local-variable slot in the main chunk)
+FZPROF = { on = false, s = {} }
+FZPROF.add = function(name, dt)
+    local s = FZPROF.s[name]
+    if not s then
+        s = { n = 0, sum = 0, max = 0 }
+        FZPROF.s[name] = s
+    end
+    s.n = s.n + 1
+    s.sum = s.sum + dt
+    if dt > s.max then s.max = dt end
+end
+
+local function guarded(fn, name)
+    local P = FZPROF
+    if P.on and name then
+        local t0 = tick()
+        local ok = pcall(fn)
+        P.add(name, tick() - t0)
+        if not ok then loadErrors = loadErrors + 1 end
+        return
+    end
     local ok = pcall(fn)
     if not ok then loadErrors = loadErrors + 1 end
 end
 
--- Staff detection (only Early Access counts, Elite and other passes are ignored):
---   1) ReplicatedStorage.Players.<name>  -> Bool "EarlyAccessUser" (attribute, or a BoolValue child)
---   2) failsafe: ReplicatedStorage.Players.<name>.Status.Purchases.Passes -> Bool "GivenEarlyAccess"
---   3) failsafe: ReplicatedStorage.Players.<name>.Status.GameplayVariables -> Bool "GodMode"
+-- Staff detection: game.Players.<name> has the attributes SpecialChatTag = "Early Access" and/or
+-- SpecialChatTagColor = (217, 0, 4). Failsafe: ReplicatedStorage.Players.<name>.Status.GameplayVariables -> Bool "GodMode"
 local STAFF_LABEL = "Early Access"
 
 local TICK_SECONDS = 0.5       -- main loop interval
@@ -711,7 +733,7 @@ do
     end
 
     RunService.RenderStepped:Connect(function()
-        guarded(noteStep)
+        guarded(noteStep, "notifications (per frame)")
     end)
 end
 
@@ -749,6 +771,7 @@ local IMPORTANT_TOGGLES = {
     { id = "opt_stafflist", label = "Staff Alert",  default = true,  cb = printToggle("Staff Alert") },
     { id = "opt_info",      label = "Player Info",  default = true,  cb = printToggle("Player Info") },
     { id = "opt_teams",     label = "View Player Teams", default = true, cb = printToggle("View Player Teams") },
+    { id = "opt_modtag",    label = "Moderator Tag", default = true, cb = printToggle("Moderator Tag") },
 }
 
 local SERVER_TOGGLES = {
@@ -761,6 +784,7 @@ local INVENTORY_TOGGLES = {
     { id = "opt_inv",    label = "Inv Aim",           default = true, cb = printToggle("Inv Aim") },
     { id = "opt_hotbar", label = "Hotbar",            default = true, cb = printToggle("Hotbar") },
     { id = "opt_attico", label = "Attachment Icons",  default = true, cb = printToggle("Attachment Icons") },
+    { id = "opt_stim",   label = "Stim Toggle",       default = true, cb = printToggle("Stim Toggle") },
 }
 
 -- One "Filter <category>" toggle per category (built once)
@@ -847,7 +871,19 @@ end
 -- If the menu font cannot draw the emoji and shows boxes / "?", swap them for "/!\" here.
 local DEBUG_TITLE = "\u{26A0}\u{FE0F} Debug Options \u{26A0}\u{FE0F}"
 
+-- Config buttons: the real functions are created at the end of the script (CONFIG SYSTEM block),
+-- these wrappers are built once so the menu callback allocates nothing.
+Notification.cfgSaveBtn = function()
+    local f = Notification.cfgSave
+    if f then f() end
+end
+Notification.cfgLoadBtn = function()
+    local f = Notification.cfgLoad
+    if f then f() end
+end
+
 UI.AddTab("FuzzyHook - PRIVATE", function(tab)
+    local profT0 = FZPROF.on and tick() -- menu callback timing (runs every frame)
     -- Left column: toggles
     local important = addToggleSection(tab, "Important Toggles", "Left", IMPORTANT_TOGGLES)
     important:Text(reportLabel)
@@ -874,6 +910,12 @@ UI.AddTab("FuzzyHook - PRIVATE", function(tab)
     settings:Toggle("opt_icons_off", "Disable Icon Loading", false)
     settings:Tip("If enabled disable loading the icons from the github repo for performance, re enable if you want icons again")
     settings:Tip("Disables the Hotbar fade and notification slide animations")
+
+    -- Config: saves / loads every setting + panel positions (auto-loads on launch if a config exists)
+    local cfg = tab:Section("Config", "Left")
+    cfg:Button("Save Config", Notification.cfgSaveBtn)
+    cfg:Button("Load Config", Notification.cfgLoadBtn)
+    cfg:Text("Auto-loads on launch once saved")
 
     -- Right column: every filter / colour picker in its own section, then Debug Options at the bottom.
     -- Scrollable sections do not draw their own name, so the title is a text line.
@@ -915,9 +957,13 @@ UI.AddTab("FuzzyHook - PRIVATE", function(tab)
     iface:Button("Reset UI Positions", onResetClick)
     iface:Button("Test Notification", onTestNotifyClick)
     iface:Button("Hotbar Debug (prints)", onIconTestClick)
+    iface:Toggle("opt_prof", "Performance Profiler", false)
+    iface:Button("Performance Report (prints)", FZPROF.report)
     iface:Button("Dropped Item Debug (prints)", Notification.dropDebug)
+    iface:Button("Staff Debug (prints)", Notification.staffDebug)
     iface:Toggle("inv_showall", "Inv Aim: Show All (debug)", false)
     iface:Text("Drag a panel by its top bar")
+    if profT0 then FZPROF.add("menu tab callback (per frame)", tick() - profT0) end
 end)
 
 ----------------------------------------------------------------------
@@ -930,14 +976,6 @@ local function getPlayersFolder()
         playersFolder = ReplicatedStorage:FindFirstChild("Players")
     end
     return playersFolder
-end
-
--- ReplicatedStorage.Players.<name>.Status.Purchases.Passes (no temp tables)
-local function getPasses(folder, name)
-    local n = folder:FindFirstChild(name)
-    n = n and n:FindFirstChild("Status")
-    n = n and n:FindFirstChild("Purchases")
-    return n and n:FindFirstChild("Passes")
 end
 
 -- Reports: ReplicatedStorage.Players.<you>.Status.UAC.Reports (count is attribute "1")
@@ -968,11 +1006,62 @@ local function readFlag(inst, name)
     return false
 end
 
--- plrFolder = ReplicatedStorage.Players.<name>, passes = its Status.Purchases.Passes (may be nil)
-local function isEarlyAccess(plrFolder, passes)
-    if readFlag(plrFolder, "EarlyAccessUser") then return true end
-    if passes and readFlag(passes, "GivenEarlyAccess") then return true end -- failsafe
+-- Staff check on the PLAYER INSTANCE (game.Players.<name>). Staff carry the attributes
+--   SpecialChatTag       (String) = "Early Access"
+--   SpecialChatTagColor  (Color3) = 217, 0, 4
+-- Returns true (staff), false (the attributes are there and are not the staff tag), or nil (neither
+-- attribute exists yet: they may load a moment after the player joins).
+local function colorIsStaff(c)
+    if c == nil then return nil end
+    local okc, r, g, b = pcall(function() return c.R, c.G, c.B end)
+    if not okc then return false end
+    if type(r) ~= "number" or type(g) ~= "number" or type(b) ~= "number" then return false end
+    if r <= 1 and g <= 1 and b <= 1 then r, g, b = r * 255, g * 255, b * 255 end -- 0-1 range -> 0-255
+    return math.abs(r - 217) <= 3 and g <= 3 and math.abs(b - 4) <= 3
+end
+
+local function isStaffPlayer(plr)
+    local okt, tag, col = pcall(function()
+        return plr:GetAttribute("SpecialChatTag"), plr:GetAttribute("SpecialChatTagColor")
+    end)
+    if not okt then return nil end
+    if tag == nil and col == nil then return nil end
+    if type(tag) == "string" and string.lower(tag) == "early access" then return true end
+    if colorIsStaff(col) then return true end
     return false
+end
+
+-- "Staff Debug (prints)" button (Debug Options): shows what every player's tag attributes look like
+Notification.staffDebug = function()
+    local ok, err = pcall(function()
+        local rf = ReplicatedStorage:FindFirstChild("Players")
+        local list = Players:GetPlayers()
+        print("[Staff debug] players in game.Players: " .. #list .. " | ReplicatedStorage.Players found: " .. tostring(rf ~= nil))
+        for i = 1, #list do
+            local plr = list[i]
+            local name = plr.Name
+            local function dump(inst, where)
+                if not inst then return where .. ": (not found)" end
+                local tag = inst:GetAttribute("SpecialChatTag")
+                local col = inst:GetAttribute("SpecialChatTagColor")
+                local txt = where .. ": tag=" .. tostring(tag) .. " [" .. typeof(tag) .. "] colour=" .. tostring(col) .. " [" .. typeof(col) .. "]"
+                if col ~= nil then
+                    local okc, r, g, b = pcall(function() return col.R, col.G, col.B end)
+                    txt = txt .. (okc and (" R,G,B=" .. tostring(r) .. "," .. tostring(g) .. "," .. tostring(b)) or " (no R/G/B fields)")
+                end
+                return txt .. " -> staff=" .. tostring(isStaffPlayer(inst))
+            end
+            print("[Staff debug] " .. name .. " | " .. dump(plr, "game.Players") .. " | " .. dump(rf and rf:FindFirstChild(name), "ReplicatedStorage.Players"))
+            local okA, attrs = pcall(function() return plr:GetAttributes() end)
+            if okA and type(attrs) == "table" then
+                local keys = {}
+                for k in pairs(attrs) do keys[#keys + 1] = tostring(k) end
+                print("[Staff debug]   all attributes on game.Players." .. name .. ": " .. (#keys > 0 and table.concat(keys, ", ") or "(none)"))
+            end
+        end
+        print("[Staff debug] done")
+    end)
+    if not ok then print("[Staff debug] error: " .. tostring(err)) end
 end
 
 ----------------------------------------------------------------------
@@ -1088,7 +1177,9 @@ local lastReports -- nil while Report Alert is off; baseline count while on
 task.spawn(function()
     while true do
         -- Report Count label (always) + Report Alert (toggle)
+        local pt = FZPROF.on and tick()
         local ok, count = pcall(readReports)
+        if pt then FZPROF.add("report count read (2/s)", tick() - pt) end
         if not ok then loadErrors = loadErrors + 1 end
 
         if ok and type(count) == "number" then
@@ -1160,6 +1251,15 @@ RunService.RenderStepped:Connect(function()
         end
     end
 
+    -- "Moderator Tag" toggle (Important Toggles): hides the red [POSSIBLE MOD] labels; "God Moded"
+    -- labels stay. Read at most 4 times a second.
+    local nowT = tick()
+    if nowT - (Notification.modTagAt or 0) > 0.25 then
+        Notification.modTagAt = nowT
+        Notification.modTagOn = UI.GetValue("opt_modtag") ~= false
+    end
+    local modTagOn = Notification.modTagOn ~= false
+
     for name, mode in pairs(modTargets) do
         local e = modLabels[name]
         if not e then
@@ -1199,7 +1299,7 @@ RunService.RenderStepped:Connect(function()
             end
         end
 
-        if part then
+        if part and (mode == "god" or modTagOn) then
             local pos, onScreen = WorldToScreen(part.Position + LABEL_OFFSET)
             if onScreen then
                 d.Position = Vector2.new(pos.X, pos.Y - 7)
@@ -1293,30 +1393,56 @@ local function updateInfoPanel(name, reports, play)
 end
 
 -- Closest player to the screen center within INFO_RADIUS (squared compare, no sqrt)
+-- PERFORMANCE: this used to read every player's Character, HumanoidRootPart and Position on every call
+-- (10x/s, ~44 ms). Now the root parts are looked up once per 3 seconds (kept in Notification.hrpCache,
+-- no extra local variable) and each call only reads their Position + projects it. A player who just
+-- respawned can take up to 3 seconds to be selectable again.
 local function findLookedAtPlayer()
     local view = Workspace.CurrentCamera.ViewportSize
     local cx, cy = view.X * 0.5, view.Y * 0.5
-    local bestSq = INFO_RADIUS * INFO_RADIUS
+    local radSq = INFO_RADIUS * INFO_RADIUS
+    local bestSq = radSq
     local best
+    local last, prevSq = Notification.lookBest, nil -- hysteresis: the previous target must be clearly beaten
 
-    for _, plr in ipairs(Players:GetPlayers()) do
-        local name = plr.Name
-        if name ~= LOCAL_NAME then
-            local char = plr.Character
-            local hrp = char and char:FindFirstChild("HumanoidRootPart")
-            if hrp then
-                local pos, onScreen = WorldToScreen(hrp.Position)
-                if onScreen then
-                    local dx, dy = pos.X - cx, pos.Y - cy
-                    local sq = dx * dx + dy * dy
-                    if sq < bestSq then
-                        bestSq = sq
-                        best = name
-                    end
+    local cache = Notification.hrpCache
+    local now = tick()
+    if not cache or now - Notification.hrpAt >= 3 then
+        cache = {}
+        Notification.hrpCache = cache
+        Notification.hrpAt = now
+        for _, plr in ipairs(Players:GetPlayers()) do
+            local name = plr.Name
+            if name ~= LOCAL_NAME then
+                local char = plr.Character
+                local hrp = char and char:FindFirstChild("HumanoidRootPart")
+                if hrp then cache[name] = hrp end
+            end
+        end
+    end
+
+    for name, hrp in pairs(cache) do
+        local p = hrp.Position
+        if p then
+            local pos, onScreen = WorldToScreen(p)
+            if onScreen then
+                local dx, dy = pos.X - cx, pos.Y - cy
+                local sq = dx * dx + dy * dy
+                if name == last and sq < radSq then prevSq = sq end
+                if sq < bestSq then
+                    bestSq = sq
+                    best = name
                 end
             end
         end
     end
+
+    -- PERFORMANCE: with two players near the crosshair the "closest" one kept flipping, and every flip
+    -- re-read every panel. A new player must now be at least 40 px closer than the current target.
+    if best and last and best ~= last and prevSq and math.sqrt(bestSq) > math.sqrt(prevSq) - 40 then
+        best = last
+    end
+    Notification.lookBest = best
     return best
 end
 
@@ -1511,23 +1637,41 @@ do
     end
 
     function updateInvPanel(name)
-        local folder = getPlayersFolder()
-        local plr = folder and folder:FindFirstChild(name)
-        local inv = plr and plr:FindFirstChild("Inventory")
+        -- PERFORMANCE: an inventory scan costs ~50 ms. The finished rows are cached per player for 4 seconds
+        -- (invCache.by), together with the filter settings they were built with, so looking back at a player
+        -- you just looked at (or changing nothing) does not re-scan. Changing a filter rebuilds at once.
+        local by = invCache.by
+        if not by then by = { n = 0 } invCache.by = by end
 
+        local sig = ""
+        for i = 1, #CATEGORY_TOGGLES do
+            local t = CATEGORY_TOGGLES[i]
+            local h = UI.GetValue(t.id) == true
+            invHidden[t.cat] = h
+            sig = sig .. (h and "1" or "0")
+        end
+        local showAll = UI.GetValue("inv_showall") == true
+        sig = sig .. (showAll and "A" or "-")
+
+        local now = tick()
+        local c = by[name]
+        local hit = (c ~= nil and c.sig == sig and now - c.at < 4)
         local out = {}
-        if not inv then
-            out[1] = "No inventory found"
-        else
-            for i = 1, #CATEGORY_TOGGLES do
-                local t = CATEGORY_TOGGLES[i]
-                invHidden[t.cat] = UI.GetValue(t.id) == true
-            end
 
-            local state = { count = 0, truncated = false, all = UI.GetValue("inv_showall") == true }
-            collectInventory(inv:GetChildren(), 0, out, state)
-            if state.truncated then out[#out + 1] = "..." end
-            if #out == 0 then out[1] = "(nothing to show)" end
+        if hit then
+            for i = 1, #c.out do out[i] = c.out[i] end
+        else
+            local folder = getPlayersFolder()
+            local plr = folder and folder:FindFirstChild(name)
+            local inv = plr and plr:FindFirstChild("Inventory")
+            if not inv then
+                out[1] = "No inventory found"
+            else
+                local state = { count = 0, truncated = false, all = showAll }
+                collectInventory(inv:GetChildren(), 0, out, state)
+                if state.truncated then out[#out + 1] = "..." end
+                if #out == 0 then out[1] = "(nothing to show)" end
+            end
         end
 
         -- keep within the pooled rows
@@ -1535,6 +1679,16 @@ do
             local extra = #out - (INV_MAX_LINES - 1)
             for i = #out, INV_MAX_LINES, -1 do out[i] = nil end
             out[INV_MAX_LINES] = "... +" .. extra .. " more"
+        end
+
+        if not hit then
+            if not c then
+                if by.n >= 12 then by = { n = 0 } invCache.by = by end -- keep the cache small
+                by.n = by.n + 1
+            end
+            local copy = {}
+            for i = 1, #out do copy[i] = out[i] end
+            by[name] = { sig = sig, at = now, out = copy }
         end
 
         -- only write text that actually changed
@@ -1594,7 +1748,7 @@ do
     -- player and why an icon is not loading.
     ----------------------------------------------------------------------
     local EQUIP_MAX_NODES = 1500    -- safety cap on objects looked at per debug scan
-    local EQUIP_REFRESH = 1.5       -- seconds between re-reads of the targeted player
+    local EQUIP_REFRESH = 3         -- seconds between re-reads of the targeted player (was 1.5: each read costs ~60 ms)
     -- Hosts tried in order for every icon (jsDelivr caches @main for a while: after
     -- pushing new images, put the raw GitHub URL first or use a commit hash / tag).
     local IMG_BASES = {
@@ -1612,7 +1766,7 @@ do
     local MIN_W = 210                     -- only used for the very first position
     local MAX_TILES = 10
     local MAX_HOT = 7                    -- hotbar row: ItemBack1, ItemBack2, Hotbar4 .. Hotbar8
-    local HOT_REFRESH = 0.3              -- seconds between hotbar / equipped-tool re-reads (cheap, so fast)
+    local HOT_REFRESH = 0.5              -- seconds between hotbar / equipped-tool re-reads (was 0.3: ~30 ms each on a slow PC)
     -- slot names inside ReplicatedStorage.Players.<name>.Status.GameplayVariables.Hotbar
     -- (capitalisation is ignored; an empty slot is simply not shown)
     -- (the game also has "ItemHip1" = sidearm and "Melee" = knife slots; add them to this list to show them too.
@@ -1654,7 +1808,7 @@ do
     local ATT = {
         fastmt = { "QuadNVG", "TitanShield" },                 -- FastMT with ALL of these is really a GMT
         visors = { Altyn = { "MaskaVisor", "AltynVisor" } },   -- helmet -> visor corner icon (first one found wins)
-        gun = { "RK2", "Reapir", "PEQ15", "SOCOM556" },        -- gun attachments shown as stacked corner icons
+        gun = { "RK2", "Reapir", "PEQ15", "SOCOM556", "RK6", "ACOG", "SniperScope", "LPVO", "TimberWolfSuppressor", "StockVSS" }, -- gun attachments shown as stacked corner icons (a tile fits 4; earlier names win)
     }
 
     ----------------------------------------------------------------------
@@ -1773,6 +1927,23 @@ do
     -- y = 44 keeps it below the compass bar at the top of the screen
     local hbPanel = newPanel("hotbar", math.floor((Workspace.CurrentCamera.ViewportSize.X - MIN_W) / 2), 44, MIN_W, 60)
 
+    -- STIM DISPLAY state (kept on hbPanel: this chunk is at Lua's 200-local limit).
+    -- Buffs live as ATTRIBUTES on ReplicatedStorage.Players.<name>.Status.GameplayVariables.Buffs
+    -- (the value is only the countdown, so only "is the attribute there" matters).
+    -- slots[k] = { img = icon, dot = coloured fallback dot, name, has } are created in the hbOK block below.
+    hbPanel.st = {
+        names = { "SerumYellow", "SerumRed", "SerumPurple", "SerumGreen" }, -- icon file = <name>.png in the repo
+        colors = {
+            SerumYellow = Color3.fromRGB(255, 215, 0),
+            SerumRed = Color3.fromRGB(255, 70, 70),
+            SerumPurple = Color3.fromRGB(170, 100, 255),
+            SerumGreen = Color3.fromRGB(70, 220, 110),
+        },
+        slots = {},
+        n = 0,    -- how many stims are active on the targeted player
+        sz = 16,  -- icon size (px)
+    }
+
     local rPill, rTitle, rMsgBg, rMsg, rTeamBg, rTeamHead
     local tiles = {}            -- equipment row: per tile bg, stroke, img, label, subBg, sub (records), hasImg, hasSub, eq
     local hotTiles = {}         -- hotbar-items row (same kind of tiles)
@@ -1796,6 +1967,21 @@ do
             Font = Drawing.Fonts.SystemBold, Size = 12, Center = true,
             ZIndex = 2, Visible = false,
         }, 0, 0)
+
+        -- stim icons: sit inside the pill, right of the name (one image + one fallback dot per stim)
+        for k = 1, #hbPanel.st.names do
+            local dot = make("Square", {
+                Filled = true, Color = GRAY,
+                Size = Vector2.new(10, 10), ZIndex = 3, Visible = false,
+            }, 0, 0)
+            pcall(function() dot.d.Corner = 5 end)
+            hbPanel.st.slots[k] = {
+                img = make("Image", {
+                    Size = Vector2.new(hbPanel.st.sz, hbPanel.st.sz), ZIndex = 3, Visible = false,
+                }, 0, 0),
+                dot = dot, name = nil, has = false,
+            }
+        end
 
         -- small card used for "Inventory not found" / "No equipment found"
         rMsgBg = make("Square", {
@@ -1950,6 +2136,13 @@ do
         local noGear = s and eqCount == 0
         setVis(rPill, s)
         setVis(rTitle, s)
+        local st = hbPanel.st
+        for k = 1, #st.slots do
+            local sl = st.slots[k]
+            local on = s and k <= st.n
+            setVis(sl.img, on and sl.has)
+            setVis(sl.dot, on and not sl.has) -- no icon loaded (yet / icons off): coloured dot instead
+        end
         setVis(rMsgBg, noGear)
         setVis(rMsg, noGear)
         setRowVisible(hotTiles, hotCount, s)
@@ -2016,7 +2209,7 @@ do
 
             hbPanel.writeFade(a == 1)                -- on completion, also refresh hidden drawings
             if a == 0 then applyVisibility() end     -- fade-out done: actually hide everything
-        end)
+        end, "hotbar fade (per frame)")
     end)
 
     -- Recomputes size + offsets (only called when something changed), keeps the
@@ -2031,7 +2224,11 @@ do
 
         local n = eqCount
         local hn = hotCount
-        local pillW = #titleStr * 6 + 36   -- same padding left and right of the centered name
+        local st = hbPanel.st
+        local sn = st.n
+        local textW = #titleStr * 6
+        -- same padding left and right; the pill grows to fit the stim icons right of the name
+        local pillW = textW + 36 + ((sn > 0) and (sn * (st.sz + 3) + 2) or 0)
         local hotW = (hn > 0) and (hn * TILE + (hn - 1) * GAP) or 0
         local tilesW = (n > 0) and (n * TILE + (n - 1) * GAP) or 0
         local msgW = (n == 0) and (#msgStr * 6.5 + PAD * 2) or 0
@@ -2086,7 +2283,14 @@ do
         rPill.ox, rPill.oy = pillX, 0
         rPill.d.Size = Vector2.new(pillW, PILL_H)
         -- Center = true centers the text on BOTH axes (x and y are its middle point), so y is the pill's middle
-        rTitle.ox, rTitle.oy = pillX + pillW / 2 + TITLE_NUDGE_X, PILL_H / 2 - 1
+        rTitle.ox, rTitle.oy = pillX + 18 + textW / 2 + TITLE_NUDGE_X, PILL_H / 2 - 1
+        for k = 1, sn do
+            local sl = st.slots[k]
+            local ix = pillX + 18 + textW + 6 + (k - 1) * (st.sz + 3)
+            local iy = (PILL_H - st.sz) / 2
+            sl.img.ox, sl.img.oy = ix, iy
+            sl.dot.ox, sl.dot.oy = ix + 3, iy + 3
+        end
         -- only the pill grabs the mouse for dragging (see dragStep)
         hbPanel.hx, hbPanel.hw = pillX, pillW
         local y = PILL_H + PILL_GAP
@@ -2127,6 +2331,7 @@ do
 
         -- positions of the drawings in use
         put(rPill); put(rTitle)
+        for k = 1, sn do put(st.slots[k].img); put(st.slots[k].dot) end
         if n == 0 then put(rMsgBg); put(rMsg) end
         putRow(hotTiles, hn)
         putRow(tiles, n)
@@ -2251,39 +2456,74 @@ do
         return clansFolder
     end
 
-    -- Returns the team folder name and the sorted list of member names for `name`,
-    -- or nil if they are in no team
-    local function findTeam(name)
-        local clans = getClansFolder()
-        if not clans then return nil end
+    -- TEAM SNAPSHOT (performance): the old code rescanned EVERY team folder (GetDescendants on each, in one
+    -- go) every time the targeted player changed: about 200 ms per call. Now a background thread builds a
+    -- snapshot of all teams, ONE team folder per frame (it yields in between, so a rebuild never freezes a
+    -- frame), and refreshes it every 15 seconds. Looking up a player's team is then a free table lookup.
+    -- It only runs while "View Player Teams" is on. (State lives on hbPanel.tm: no extra local variables.)
+    -- A player who joins or changes team can take up to 15 seconds to show up in a team line.
+    hbPanel.tm = { snap = nil, at = 0, want = false }
 
-        local teams = clans:GetChildren()
-        for i = 1, #teams do
-            local team = teams[i]
-            local leader = string.match(team.Name, "^(.+)'s [Tt]eam$")
-            local desc = team:GetDescendants()
-            local limit = #desc
-            if limit > TEAMS_MAX_NODES then limit = TEAMS_MAX_NODES end
+    -- Reads one team folder: { name, members (sorted, only real players), set = every name found inside }
+    hbPanel.tmScan = function(team)
+        local leader = string.match(team.Name, "^(.+)'s [Tt]eam$")
+        local desc = team:GetDescendants()
+        local limit = #desc
+        if limit > TEAMS_MAX_NODES then limit = TEAMS_MAX_NODES end
 
-            local seen, members = {}, {}
-            local inTeam = (leader == name)
-            if leader and Players:FindFirstChild(leader) then
+        local set, seen, members = {}, {}, {}
+        if leader then
+            set[leader] = true
+            if Players:FindFirstChild(leader) then
                 seen[leader] = true
                 members[1] = leader
             end
-            for j = 1, limit do
-                local n = desc[j].Name
-                if n == name then inTeam = true end
-                if not seen[n] and Players:FindFirstChild(n) then
-                    seen[n] = true
-                    members[#members + 1] = n
-                end
+        end
+        for j = 1, limit do
+            local n = desc[j].Name
+            set[n] = true
+            if not seen[n] and Players:FindFirstChild(n) then
+                seen[n] = true
+                members[#members + 1] = n
             end
+        end
+        table.sort(members)
+        return { name = team.Name, members = members, set = set }
+    end
 
-            if inTeam then
-                table.sort(members)
-                return team.Name, members
+    task.spawn(function()
+        local tm = hbPanel.tm
+        while true do
+            if tm.want and (tm.snap == nil or tick() - tm.at >= 15) then
+                local teams
+                local clans = getClansFolder()
+                if clans then
+                    local okc, res = pcall(function() return clans:GetChildren() end)
+                    if okc then teams = res end
+                end
+                local snap = {}
+                if teams then
+                    for i = 1, #teams do
+                        local ok, entry = pcall(hbPanel.tmScan, teams[i])
+                        if ok and entry then snap[#snap + 1] = entry end
+                        task.wait() -- one team folder per frame; this yield is deliberately outside pcall
+                    end
+                end
+                tm.snap = snap
+                tm.at = tick()
             end
+            wait(1)
+        end
+    end)
+
+    -- Returns the team folder name and the sorted list of member names for `name` (from the snapshot),
+    -- or nil if they are in no team
+    local function findTeam(name)
+        local snap = hbPanel.tm.snap
+        if not snap then return nil end
+        for i = 1, #snap do
+            local e = snap[i]
+            if e.set[name] then return e.name, e.members end
         end
         return nil
     end
@@ -2291,6 +2531,8 @@ do
     -- Returns the team line and the member-name rows for `name`
     local function teamInfo(name)
         if not getClansFolder() then return "Team: unknown", {} end
+        hbPanel.tm.want = true
+        if not hbPanel.tm.snap then return "Team: loading...", {} end -- first snapshot is still being built
         local teamName, members = findTeam(name)
         if not teamName then return "Team: none", {} end
 
@@ -2379,22 +2621,57 @@ do
         return nil
     end
 
+    -- PERFORMANCE: reaching GameplayVariables takes 4 instance lookups and the Hotbar folder another 1-2,
+    -- and it was repeated on every hotbar read (about 3 times a second). The two instances are now kept
+    -- per player (hbPanel.gvc) and only looked up again when the player changes or the instance is gone.
     local function gameplayVars(name)
+        local gvc = hbPanel.gvc
+        if gvc and gvc.name == name and gvc.gv and gvc.gv.Parent ~= nil then
+            return gvc.gv, gvc
+        end
         local folder = getPlayersFolder()
         local n = folder and folder:FindFirstChild(name)
         n = n and n:FindFirstChild("Status")
-        return n and n:FindFirstChild("GameplayVariables")
+        local gv = n and n:FindFirstChild("GameplayVariables")
+        if not gv then return nil end
+        gvc = { name = name, gv = gv, src = nil }
+        hbPanel.gvc = gvc
+        return gv, gvc
     end
 
     -- Fills out[1..n] with the items in the hotbar slots (slot order, empty slots skipped).
     -- Returns n and the name of the held tool (nil when nothing is equipped).
     local function readHotbar(name, out)
-        local gv = gameplayVars(name)
+        local gv, gvc = gameplayVars(name)
         if not gv then return 0, nil end
-        local src = findCI(gv, "Hotbar") or gv
+        local src = gvc and gvc.src
+        if not src or src.Parent == nil then
+            src = findCI(gv, "Hotbar") or gv
+            if gvc then gvc.src = src end
+        end
+
+        -- PERFORMANCE: readItemName() looked each slot up with findCI, which scans the WHOLE hotbar
+        -- again for every slot that is empty / missing. The hotbar's children are now listed once
+        -- (lowercase name -> child) and every slot is looked up in that table.
+        local map = {}
+        local kids = src:GetChildren()
+        for i = 1, #kids do map[string.lower(kids[i].Name)] = kids[i] end
+
         local n = 0
         for i = 1, #HOT_SLOTS do
-            local item = readItemName(src, HOT_SLOTS[i])
+            local key = HOT_SLOTS[i]
+            local item = nameOf(src:GetAttribute(key))
+            if not item then
+                local c = map[string.lower(key)]
+                if c then
+                    local okv, v = pcall(function() return c.Value end)
+                    if okv then item = nameOf(v) end
+                    if not item then
+                        local inner = c:GetChildren()
+                        if #inner > 0 then item = inner[1].Name end
+                    end
+                end
+            end
             if item then
                 n = n + 1
                 out[n] = item
@@ -2443,6 +2720,59 @@ do
         return key
     end
 
+    -- STIM DISPLAY: checks the 4 stim names on ...GameplayVariables.Buffs (attributes, or children as a fallback).
+    -- Called from the hotbar read (about 3x/s) and only while "Stim Toggle" is on. The Buffs folder is cached
+    -- per player (gvc.bf), nothing is allocated, and drawings are only touched when the stim list changes.
+    -- Returns true when the pill needs a re-layout.
+    function hbPanel.stim(target)
+        local st = hbPanel.st
+        local n = 0
+        local changed = false
+
+        if target and UI.GetValue("opt_stim") == true then
+            local gv, gvc = gameplayVars(target)
+            if gv then
+                local buffs = gvc and gvc.bf
+                if not buffs or buffs.Parent == nil then
+                    buffs = gv:FindFirstChild("Buffs")
+                    if buffs and buffs.Name == "Unreadable_name" then buffs = nil end
+                    if gvc then gvc.bf = buffs end
+                end
+                if buffs then
+                    local iconsOn = UI.GetValue("opt_icons_off") ~= true
+                    local names = st.names
+                    for i = 1, #names do
+                        local nm = names[i]
+                        local v = buffs:GetAttribute(nm)
+                        if v == nil and buffs:FindFirstChild(nm) then v = true end
+                        -- the value is just the countdown: any value except nil / false / 0 = buff is on
+                        if v ~= nil and v ~= false and v ~= 0 then
+                            n = n + 1
+                            local sl = st.slots[n]
+                            local has = iconsOn and imgState[nm] == "ok"
+                            if sl.name ~= nm or sl.has ~= has then
+                                sl.name, sl.has = nm, has
+                                if has then
+                                    sl.img.d.Data = imgData[nm]
+                                else
+                                    sl.dot.d.Color = st.colors[nm]
+                                end
+                                changed = true
+                            end
+                            if iconsOn and not has then requestImage(nm) end
+                        end
+                    end
+                end
+            end
+        end
+
+        if n ~= st.n then
+            st.n = n
+            changed = true
+        end
+        return changed
+    end
+
     local hotTarget, hotLastRead = nil, 0
     local hotRead = {}
 
@@ -2466,6 +2796,7 @@ do
         if target == nil and hbPanel.fa > 0 then wantTeamRow = teamOn end -- keep the team card while fading out
         if wantTeamRow ~= teamOn then
             teamOn = wantTeamRow
+            hbPanel.tm.want = wantTeamRow -- the background snapshot only runs while the team card is on
             if teamOn then teamTarget = nil end -- read right away
             dirty = true
         end
@@ -2484,7 +2815,28 @@ do
                 lastRead = now
                 hbPanel.att = wantAtt -- remembers the toggle so flipping it updates right away
 
-                local found, n = readEquipment(target, eqRead, eqSub)
+                -- PERFORMANCE: this read costs ~70 ms and was being repeated about 2-3 times a second
+                -- (every time the looked-at player changed or an icon finished loading). The result is now
+                -- cached per player for 5 seconds (hbPanel.ec), so those repeats cost nothing.
+                local ec = hbPanel.ec
+                if not ec then ec = { n = 0 } hbPanel.ec = ec end
+                local c = ec[target]
+                local found, n
+                if c and now - c.at < 5 then
+                    found, n = c.found, c.n
+                    for k = 1, n do eqRead[k] = c.items[k]; eqSub[k] = c.subs[k] end
+                else
+                    local pt = FZPROF.on and tick()
+                    found, n = readEquipment(target, eqRead, eqSub)
+                    if pt then FZPROF.add("hotbar: read equipment (FindFirstChild x45)", tick() - pt) end
+                    if not c then
+                        if ec.n >= 12 then ec = { n = 0 } hbPanel.ec = ec end -- keep the cache small
+                        ec.n = ec.n + 1
+                    end
+                    local items, subs = {}, {}
+                    for k = 1, n do items[k] = eqRead[k]; subs[k] = eqSub[k] end
+                    ec[target] = { at = now, found = found, n = n, items = items, subs = subs }
+                end
 
                 local title = target
                 if title ~= titleStr then
@@ -2527,9 +2879,13 @@ do
                 hotTarget = target
                 hotLastRead = now
 
+                local pt = FZPROF.on and tick()
                 local hn, equipped = readHotbar(target, hotRead)
+                if pt then FZPROF.add("hotbar: read hotbar slots + equipped tool", tick() - pt) end
                 if hn > MAX_HOT then hn = MAX_HOT end
                 curEquipped = equipped
+
+                if hbPanel.stim(target) then dirty = true end -- stim icons next to the name
 
                 if hn ~= hotCount then
                     hotCount = hn
@@ -2541,10 +2897,34 @@ do
                     local raw = hotRead[i]          -- name in the game files
                     local item = raw                -- name / icon shown
                     local key = nil                 -- attachment corner icons
-                    if raw == "M4" and isGodM4(target) then
+
+                    -- PERFORMANCE: a gun's attachments almost never change, but they used to be re-read
+                    -- (4 lookups + GetDescendants per gun, plus the GODM4 check) about 3 times a second.
+                    -- The result is now cached per player + gun for 5 seconds (hbPanel.gc), so an attachment
+                    -- change can take up to 5 seconds to show on the tile.
+                    local gc = hbPanel.gc
+                    if not gc then gc = { n = 0 } hbPanel.gc = gc end
+                    local ck = target .. "|" .. raw
+                    local ce = gc[ck]
+                    if not ce or ce.att ~= wantAtt or now - ce.at >= 5 then
+                        local pg = FZPROF.on and tick()
+                        if not ce then
+                            if gc.n >= 60 then gc = { n = 0 } hbPanel.gc = gc end -- keep the cache small
+                            gc.n = gc.n + 1
+                        end
+                        ce = { at = now, att = wantAtt, god = false, key = nil }
+                        if raw == "M4" and isGodM4(target) then
+                            ce.god = true
+                        elseif wantAtt then
+                            ce.key = gunAtts(target, raw)
+                        end
+                        gc[ck] = ce
+                        if pg then FZPROF.add("hotbar: gun attachment scan (cache miss)", tick() - pg) end
+                    end
+                    if ce.god then
                         item = "GODM4"              -- the GODM4 icon already covers its attachments
-                    elseif wantAtt then
-                        key = gunAtts(target, raw)
+                    else
+                        key = ce.key
                     end
                     local isEq = false
                     if not used and curEquipped ~= nil and raw == curEquipped then
@@ -2576,7 +2956,9 @@ do
             if teamOn and (target ~= teamTarget or now - teamLastRead >= TEAMS_REFRESH) then
                 teamTarget = target
                 teamLastRead = now
+                local pt = FZPROF.on and tick()
                 local text, rows = teamInfo(target)
+                if pt then FZPROF.add("hotbar: team lookup (GetDescendants)", tick() - pt) end
                 if text ~= teamHeadStr then
                     teamHeadStr = text
                     rTeamHead.d.Text = text
@@ -2724,6 +3106,25 @@ do
                     break
                 end
             end
+            -- stim display: what the Buffs folder holds and why an icon is / is not loading
+            local okS, errS = pcall(function()
+                local st = hbPanel.st
+                local gv = gameplayVars(target)
+                local buffs = gv and gv:FindFirstChild("Buffs")
+                print("[Hotbar debug] stims: Stim Toggle = " .. tostring(UI.GetValue("opt_stim"))
+                    .. " | Buffs folder found = " .. tostring(buffs ~= nil) .. " | stims active = " .. st.n)
+                for i = 1, #st.names do
+                    local nm = st.names[i]
+                    local v = buffs and buffs:GetAttribute(nm)
+                    print("[Hotbar debug] stim " .. nm .. ": attribute = " .. tostring(v)
+                        .. " | icon: " .. tostring(imgState[nm]) .. " | " .. tostring(imgInfo[nm]))
+                end
+                for i = 1, st.n do
+                    local sl = st.slots[i]
+                    print("[Hotbar debug] stim slot " .. i .. ": " .. tostring(sl.name) .. " | drawn as image: " .. tostring(sl.has))
+                end
+            end)
+            if not okS then print("[Hotbar debug] stim error: " .. tostring(errS)) end
             print("[Hotbar debug] done")
         end)
     end
@@ -2744,7 +3145,16 @@ local function infoStep()
     local hbSelf = UI.GetValue("hotbar_target") == 1
 
     local needLook = wantInfo or wantInv or (wantHotbar and not hbSelf)
+    local pt0 = FZPROF.on and tick()
     local target = needLook and findLookedAtPlayer() or nil
+    -- PERFORMANCE: when the crosshair slips off a player for a moment, every panel used to be reset and
+    -- then re-read from scratch the instant it came back. The last target is now kept for 1 second.
+    if target then
+        Notification.lastT, Notification.lastTAt = target, tick()
+    elseif needLook and Notification.lastT and tick() - Notification.lastTAt < 1 then
+        target = Notification.lastT
+    end
+    if pt0 then FZPROF.add("find looked-at player (WorldToScreen all)", tick() - pt0) end
     local now = tick()
 
     -- Player Info (re-read only when the target changes or every INFO_REFRESH seconds)
@@ -2752,7 +3162,9 @@ local function infoStep()
         if target ~= infoTarget or now - infoLastRead >= INFO_REFRESH then
             infoTarget = target
             infoLastRead = now
+            local pt = FZPROF.on and tick()
             local reportsStr, playStr = readPlayerInfo(target)
+            if pt then FZPROF.add("player info panel read", tick() - pt) end
             updateInfoPanel(target, reportsStr, playStr)
         end
         showInfoPanel(true)
@@ -2766,7 +3178,9 @@ local function infoStep()
         if target ~= invTarget or now - invLastRead >= INFO_REFRESH then
             invTarget = target
             invLastRead = now
+            local pt = FZPROF.on and tick()
             updateInvPanel(target)
+            if pt then FZPROF.add("inv aim panel read (inventory scan)", tick() - pt) end
         end
         showInvPanel(true)
     else
@@ -2776,7 +3190,9 @@ local function infoStep()
 
     -- Hotbar (looked-at player, or yourself)
     if wantHotbar then
+        local pt1 = FZPROF.on and tick()
         hotbarStep(hbSelf and LOCAL_NAME or target, now, wantTeams, wantAtt)
+        if pt1 then FZPROF.add("hotbar step total", tick() - pt1) end
     else
         hotbarStep(nil, now, false, false)
     end
@@ -2784,7 +3200,7 @@ end
 
 task.spawn(function()
     while true do
-        guarded(infoStep)
+        guarded(infoStep, "info/inv/hotbar step (10/s)")
         wait(INFO_SELECT_EVERY)
     end
 end)
@@ -2795,8 +3211,8 @@ do
     ----------------------------------------------------------------------
     -- STAFF LIST PANEL (under the Boss Tracker by default)
     -- Header "Scanning for staff", then only the usernames of players who have a
-    -- Early Access flag (EarlyAccessUser on ReplicatedStorage.Players.<name>, with
-    -- Status.Purchases.Passes.GivenEarlyAccess as the failsafe).
+    -- chat tag (game.Players.<name> attributes SpecialChatTag = "Early Access" /
+    -- SpecialChatTagColor = 217, 0, 4).
     -- Matcha has no Players.PlayerAdded / PlayerRemoving events (they are nil), so
     -- game.Players is checked once a second. Only NEW players get their Passes read
     -- (retried for up to SL_MAX_TRIES seconds in case the Passes folder loads a
@@ -2815,7 +3231,7 @@ do
     local SL_MAX_ROWS = 10
     local SL_ROW_H = 16
     local SL_W = 200 -- same width as the Boss Tracker so it lines up under it (and stays clear of Server Loot)
-    local SL_MAX_TRIES = 20
+    local SL_MAX_TRIES = 6   -- scans (1 per second) to wait for the tag attributes of a new player
 
     local staffSet = {}      -- [name] = true -> has a staff tag
     local staffChecked = {}  -- [name] = true -> Passes already read for this player
@@ -2997,18 +3413,23 @@ do
         end
     end
 
-    -- Reads Passes for players that are still waiting for them
+    -- Reads the chat-tag attributes of players that are still waiting (2 attribute reads each)
     local function processStaffPending()
         if next(staffPending) == nil then return end
-        local folder = getPlayersFolder()
-        if not folder then return end
 
         for name, tries in pairs(staffPending) do
-            local plrFolder = folder:FindFirstChild(name)
-            local passes = plrFolder and getPasses(folder, name)
+            local plr = Players:FindFirstChild(name)
+            local res = plr and isStaffPlayer(plr)
+            if res ~= true then
+                -- the same attributes may sit on ReplicatedStorage.Players.<name> instead
+                local rfolder = getPlayersFolder()
+                local rf = rfolder and rfolder:FindFirstChild(name)
+                local r2 = rf and isStaffPlayer(rf)
+                if r2 == true or (res == nil and r2 ~= nil) then res = r2 end
+            end
             local isMe = (name == LOCAL_NAME)
 
-            if plrFolder and isEarlyAccess(plrFolder, passes) then
+            if res == true then
                 staffPending[name] = nil
                 staffChecked[name] = true
                 if not isMe or STAFF_LIST_INCLUDE_SELF then
@@ -3019,13 +3440,14 @@ do
                         Notification.push("Staff Detector", name .. " has " .. STAFF_LABEL, STAFF_NOTIFY)
                     end
                 end
-            elseif passes then
-                -- player folder and Passes both loaded and neither flag is on: not staff
+            elseif res == false then
+                -- the tag attributes exist and are not the staff tag
                 staffPending[name] = nil
                 staffChecked[name] = true
-            elseif tries >= SL_MAX_TRIES then
+            elseif plr == nil or tries >= SL_MAX_TRIES then
+                -- no tag attributes at all after SL_MAX_TRIES scans (normal players): not staff
                 staffPending[name] = nil
-                staffChecked[name] = true -- gave up; checked again the next time they join
+                staffChecked[name] = true -- checked again the next time they join
             else
                 staffPending[name] = tries + 1
             end
@@ -3035,6 +3457,12 @@ do
     -- Scans game.Players: queues players we have not checked yet, reads GodMode for
     -- everyone, drops ones that are gone
     local function syncStaff()
+        -- PERFORMANCE: the GodMode flag of EVERY player was read each second (about 130 ms). It is now
+        -- read every 3rd scan; a player we have never read is still checked immediately. A GodMode
+        -- change can take up to 3 seconds to show. (counter kept on slPanel: no extra local variable)
+        slPanel.gtick = ((slPanel.gtick or 0) + 1) % 3
+        local godNow = (slPanel.gtick == 0)
+
         local present = {}
         for _, plr in ipairs(Players:GetPlayers()) do
             local name = plr.Name
@@ -3042,7 +3470,9 @@ do
             if not staffChecked[name] and staffPending[name] == nil then
                 staffPending[name] = 0
             end
-            checkGod(name)
+            if godNow or godSeen[name] == nil then
+                checkGod(name)
+            end
         end
 
         for name in pairs(staffChecked) do
@@ -3097,7 +3527,7 @@ do
 
     task.spawn(function()
         while true do
-            guarded(staffStep)
+            guarded(staffStep, "staff list step (1/s)")
             wait(1)
         end
     end)
@@ -3316,7 +3746,9 @@ do
 
                     local results = {}
                     for i = 1, #names do
+                        local pt = FZPROF.on and tick()
                         local ok, counts = pcall(lootScanPlayer, names[i])
+                        if pt then FZPROF.add("loot scan, one player", tick() - pt) end
                         if not ok then
                             loadErrors = loadErrors + 1
                         elseif counts then
@@ -3326,7 +3758,7 @@ do
                     end
 
                     if UI.GetValue("opt_four") then -- still on after the scan?
-                        guarded(function() renderLoot(results) end)
+                        guarded(function() renderLoot(results) end, "loot panel render")
                     end
                 end
             else
@@ -3362,7 +3794,7 @@ do
     -- while an object with its name exists directly inside that folder):
     --   "AiZones/BTR"  ->  Workspace.AiZones.BTR.BTR80
     local BOSS_FOLDERS = { "AiZones/BTR" }
-    local BOSS_REFRESH = 3      -- seconds between scans
+    local BOSS_REFRESH = 8      -- seconds between scans (was 3: every scan lists all of Workspace, ~25 ms, up to 600 ms)
 
     local BOSS_W, BOSS_GAP = 200, 10   -- BOSS_GAP = px between this panel and Server Loot
     local BOSS_ROW_Y, BOSS_ROW_H = 36, 16
@@ -3509,7 +3941,7 @@ do
 
     task.spawn(function()
         while true do
-            guarded(bossStep)
+            guarded(bossStep, "boss tracker step (2/s)")
             wait(0.5)
         end
     end)
@@ -3523,6 +3955,30 @@ end
 ----------------------------------------------------------------------
 local function opacityStep()
     Notification.perf = UI.GetValue("opt_perf") == true
+
+    -- Performance Profiler switch: turning it on starts a fresh measurement
+    local P = FZPROF
+    local want = UI.GetValue("opt_prof") == true
+    if want and not P.on then
+        P.s = {}
+        P.t0 = tick()
+        P.kb0, P.kbMin, P.kbMax = nil, nil, nil
+        print("[Perf] profiler ON - let it run 15-30 seconds, then press 'Performance Report (prints)'")
+    elseif P.on and not want then
+        P.tEnd = tick()
+        print("[Perf] profiler OFF (the report still works until you turn it on again)")
+    end
+    P.on = want
+    if want and type(collectgarbage) == "function" then
+        local kb = collectgarbage("count")
+        if type(kb) == "number" then
+            if not P.kb0 then P.kb0, P.kbMin, P.kbMax = kb, kb, kb end
+            if kb < P.kbMin then P.kbMin = kb end
+            if kb > P.kbMax then P.kbMax = kb end
+            P.kbNow = kb
+        end
+    end
+
     local v = UI.GetValue("ui_opacity")
     if type(v) == "number" and v ~= uiOpacity then
         uiOpacity = v
@@ -3532,7 +3988,7 @@ end
 
 task.spawn(function()
     while true do
-        guarded(opacityStep)
+        guarded(opacityStep, "opacity step (5/s)")
         wait(0.2)
     end
 end)
@@ -3589,7 +4045,7 @@ local function dragStep()
 end
 
 RunService.RenderStepped:Connect(function()
-    guarded(dragStep)
+    guarded(dragStep, "drag step (per frame)")
 end)
 
 ----------------------------------------------------------------------
@@ -4202,7 +4658,7 @@ do
     end
 
     RunService.RenderStepped:Connect(function()
-        guarded(espRender)
+        guarded(espRender, "item/corpse ESP render (per frame)")
     end)
 
     local wasActive, lastScanAt = false, 0
@@ -4213,7 +4669,7 @@ do
                 local now = tick()
                 if not wasActive or now - lastScanAt >= ESP_SCAN_EVERY then
                     lastScanAt = now
-                    guarded(scanDropped)
+                    guarded(scanDropped, "item/corpse ESP scan (1/s)")
                 end
             elseif entryCount > 0 then
                 clearEntries() -- off: hide and free every label
@@ -4222,6 +4678,263 @@ do
             wait(0.1)
         end
     end)
+end
+
+----------------------------------------------------------------------
+-- PERFORMANCE REPORT (button in Debug Options). Prints, for everything the profiler measured:
+-- how often it ran, total / average / worst run time, and what share of real time it used.
+-- The "load" column is the one to watch: total run time divided by the time measured.
+-- Also prints Lua memory (current / lowest / highest seen while profiling: a big gap between lowest and
+-- highest = a lot of short-lived garbage being created) and how many Drawing objects exist.
+----------------------------------------------------------------------
+FZPROF.report = function()
+    local P = FZPROF
+    local ok, err = pcall(function()
+        if not P.t0 then
+            print("[Perf] no data yet: turn on 'Performance Profiler' in Debug Options, wait 15-30 seconds, then press this button")
+            return
+        end
+        local elapsed = (P.on and tick() or P.tEnd or tick()) - P.t0
+        if elapsed < 0.001 then elapsed = 0.001 end
+
+        local rows = {}
+        for name, st in pairs(P.s) do rows[#rows + 1] = { name = name, st = st } end
+        table.sort(rows, function(a, b) return a.st.sum > b.st.sum end)
+
+        print(string.format("[Perf] ===== report: measured for %.1f s (profiler %s) =====", elapsed, P.on and "ON" or "OFF"))
+        local total = 0
+        for i = 1, #rows do
+            local r, st = rows[i], rows[i].st
+            total = total + st.sum
+            print(string.format("[Perf] %-40s calls=%-6d total=%7.1fms avg=%7.3fms max=%7.2fms load=%5.2f%%",
+                r.name, st.n, st.sum * 1000, st.sum / st.n * 1000, st.max * 1000, st.sum / elapsed * 100))
+        end
+        print(string.format("[Perf] all measured work together: %.2f%% of real time (%.1f ms per second)",
+            total / elapsed * 100, total / elapsed * 1000))
+
+        if P.kbNow then
+            print(string.format("[Perf] Lua memory: now %.0f KB | at start %.0f KB | lowest %.0f KB | highest %.0f KB | change since start %+.0f KB",
+                P.kbNow, P.kb0, P.kbMin, P.kbMax, P.kbNow - P.kb0))
+        else
+            print("[Perf] Lua memory: collectgarbage is not available in this build")
+        end
+
+        local drawings, shown = 0, 0
+        for i = 1, #panels do
+            local p = panels[i]
+            drawings = drawings + #p.items
+            if p.shown then shown = shown + 1 end
+        end
+        print("[Perf] panels: " .. #panels .. " (" .. shown .. " visible), Drawing objects inside panels: " .. drawings)
+        print("[Perf] tip: the ESP labels and notification boxes are separate Drawing objects not counted above")
+        print("[Perf] ===== end of report =====")
+    end)
+    if not ok then print("[Perf] error: " .. tostring(err)) end
+end
+
+----------------------------------------------------------------------
+-- CONFIG SYSTEM (Config section in the menu)
+-- "Save Config" writes every setting + panel positions to FuzzyHook_config.json (workspace folder).
+-- On launch, if that file exists it is loaded automatically once the menu has been built, and
+-- "Saved Config loaded in X seconds!" is printed (X = time spent reading + applying; the short
+-- wait for the menu to appear is not counted). "Load Config" re-loads it any time.
+-- Costs nothing while running: no loops, it only works on a click / once at startup.
+-- Saved: every toggle / slider / dropdown, the World Filter colours, the two ESP keybinds
+-- (key + mode) and the position of every panel. Not saved: the debug toggles.
+-- (wrapped in a function so its locals do not count against the main chunk's 200-local limit)
+----------------------------------------------------------------------
+if not pcall(function()
+    local FILE = "FuzzyHook_config.json"
+    local Http = game:GetService("HttpService")
+    local NOTE = { seconds = 4, color = Color3.fromRGB(130, 110, 255) }
+
+    -- ids of every saved bool / number widget (built once from the same lists the menu uses)
+    local IDS = {}
+    for _, list in ipairs({ IMPORTANT_TOGGLES, SERVER_TOGGLES, INVENTORY_TOGGLES }) do
+        for i = 1, #list do IDS[#IDS + 1] = list[i].id end
+    end
+    for i = 1, #CATEGORY_TOGGLES do
+        IDS[#IDS + 1] = CATEGORY_TOGGLES[i].id
+        IDS[#IDS + 1] = CATEGORY_TOGGLES[i].espId
+    end
+    for id in string.gmatch([[opt_dropesp dropesp_range opt_corpseesp corpseesp_range ui_opacity dropesp_textsize
+        opt_perf opt_icons_off hotbar_target wtc_armor wtc_weapons wtc_super wtc_valuable wtc_meds wtc_stims
+        wtc_corpse]], "%S+") do
+        IDS[#IDS + 1] = id
+    end
+    local COLORS = {}
+    for id in string.gmatch("wtc_armor_col wtc_weapons_col wtc_super_col wtc_valuable_col wtc_meds_col wtc_stims_col wtc_corpse_col", "%S+") do
+        COLORS[#COLORS + 1] = id
+    end
+    local KEYS = { opt_dropesp_kb = "kbDrop", opt_corpseesp_kb = "kbCorpse" } -- keybind id -> field on Notification
+
+    local function same(a, b)
+        if type(a) == "number" and type(b) == "number" then return math.abs(a - b) < 0.001 end
+        return a == b
+    end
+
+    -- A colour picker's value may come back as a Color3, a table, or separate r, g, b, a numbers
+    -- (the ESP code handles all three), so it is normalised to { r, g, b, a } in 0..1.
+    local function readColor(id)
+        local r = { UI.GetValue(id) }
+        local v = r[1]
+        local R, G, B, A
+        if typeof(v) == "Color3" then
+            R, G, B, A = v.R, v.G, v.B, r[2]
+        elseif type(v) == "number" then
+            R, G, B, A = v, r[2], r[3], r[4]
+        elseif type(v) == "table" then
+            R, G, B, A = v.R or v.r or v[1], v.G or v.g or v[2], v.B or v.b or v[3], v.A or v.a or v[4]
+        end
+        if type(R) ~= "number" or type(G) ~= "number" or type(B) ~= "number" then return nil end
+        if R > 1 or G > 1 or B > 1 then R, G, B = R / 255, G / 255, B / 255 end
+        return { R, G, B, type(A) == "number" and A or 1 }
+    end
+
+    local function sameColor(a, b)
+        return a ~= nil and math.abs(a[1] - b[1]) < 0.02 and math.abs(a[2] - b[2]) < 0.02 and math.abs(a[3] - b[3]) < 0.02
+    end
+
+    -- Sets a colour picker. It is not documented what UI.SetValue wants for a colour, so the likely
+    -- forms are tried in turn and the first one that reads back correctly wins (only runs when the
+    -- current colour differs from the saved one).
+    local function setColor(id, c)
+        if sameColor(readColor(id), c) then return true end
+        local forms = {
+            function() UI.SetValue(id, Color3.new(c[1], c[2], c[3])) end,
+            function() UI.SetValue(id, { c[1], c[2], c[3], c[4] }) end,
+            function() UI.SetValue(id, c[1], c[2], c[3], c[4]) end,
+        }
+        for i = 1, #forms do
+            pcall(forms[i])
+            if sameColor(readColor(id), c) then return true end
+        end
+        return false
+    end
+
+    local function collect()
+        local cfg = { ver = 1, v = {}, c = {}, k = {}, p = {} }
+        for i = 1, #IDS do
+            local x = UI.GetValue(IDS[i])
+            if type(x) == "boolean" or type(x) == "number" then cfg.v[IDS[i]] = x end
+        end
+        for i = 1, #COLORS do
+            local c = readColor(COLORS[i])
+            if c then cfg.c[COLORS[i]] = c end
+        end
+        for id, field in pairs(KEYS) do
+            local kb = Notification[field]
+            if kb then
+                local key, mode = kb:GetKey(), kb:GetType()
+                if type(key) == "number" then cfg.k[id] = { key, mode } end
+            end
+        end
+        for i = 1, #panels do
+            local p = panels[i]
+            -- the hotbar is saved by its centre (it re-centres itself when its width changes)
+            cfg.p[p.id] = { (p.id == "hotbar") and (p.x + p.w / 2) or p.x, p.y }
+        end
+        return cfg
+    end
+
+    local function applyPanels(cfg)
+        local view = Workspace.CurrentCamera.ViewportSize
+        for i = 1, #panels do
+            local p = panels[i]
+            local s = cfg.p[p.id]
+            if type(s) == "table" and type(s[1]) == "number" and type(s[2]) == "number" then
+                local x = (p.id == "hotbar") and (s[1] - p.w / 2) or s[1]
+                p.x = clamp(x, 0, view.X - p.w)
+                p.y = clamp(s[2], 0, view.Y - DRAG_HEADER_H) -- keeps the drag bar on screen if the resolution changed
+                placePanel(p)
+            end
+        end
+    end
+
+    -- One pass: sets whatever differs from the saved value and returns how many values have not
+    -- stuck yet (e.g. a widget the menu has not created yet).
+    local function pass(cfg)
+        local left = 0
+        for id, v in pairs(cfg.v) do
+            if not same(UI.GetValue(id), v) then
+                pcall(UI.SetValue, id, v)
+                if not same(UI.GetValue(id), v) then left = left + 1 end
+            end
+        end
+        for id, c in pairs(cfg.c) do
+            if type(c) == "table" and not setColor(id, c) then left = left + 1 end
+        end
+        for id, kv in pairs(cfg.k) do
+            local kb = Notification[KEYS[id] or ""]
+            if not kb then
+                left = left + 1
+            elseif type(kv) == "table" then
+                pcall(function()
+                    if kb:GetKey() ~= kv[1] then kb:SetKey(kv[1]) end
+                    if kv[2] and kb:GetType() ~= kv[2] then kb:SetType(kv[2]) end
+                end)
+            end
+        end
+        return left
+    end
+
+    local function save()
+        if not writefile then
+            Notification.push("Config", "writefile is not available", NOTE)
+            return
+        end
+        local ok, err = pcall(function() writefile(FILE, Http:JSONEncode(collect())) end)
+        Notification.push("Config", ok and "Config saved" or ("Save failed: " .. string.sub(tostring(err), 1, 28)), NOTE)
+    end
+
+    -- Returns false when there is no (readable) saved config. Must run in its own thread (it waits).
+    local function loadCfg()
+        if not (isfile and readfile) then return false end
+        local okF, exists = pcall(isfile, FILE)
+        if not (okF and exists) then return false end
+
+        local t0 = tick()
+        local okR, raw = pcall(readfile, FILE)
+        local cfg
+        if okR and type(raw) == "string" then
+            local okD, res = pcall(function() return Http:JSONDecode(raw) end)
+            if okD then cfg = res end
+        end
+        if type(cfg) ~= "table" or type(cfg.v) ~= "table" then
+            warn("Config: the saved config could not be read")
+            return false
+        end
+        if type(cfg.c) ~= "table" then cfg.c = {} end
+        if type(cfg.k) ~= "table" then cfg.k = {} end
+        if type(cfg.p) ~= "table" then cfg.p = {} end
+
+        pcall(applyPanels, cfg)
+        local work = tick() - t0
+        for _ = 1, 6 do -- retries only matter while the menu is still being built
+            local t = tick()
+            local left = pass(cfg)
+            work = work + (tick() - t)
+            if left == 0 then break end
+            wait(0.5)
+        end
+        print(string.format("Saved Config loaded in %.2f seconds!", work))
+        return true
+    end
+
+    Notification.cfgSave = save
+    Notification.cfgLoad = function()
+        task.spawn(function()
+            if not loadCfg() then Notification.push("Config", "No saved config found", NOTE) end
+        end)
+    end
+
+    -- auto-load: give the menu a moment to build its widgets first
+    task.spawn(function()
+        wait(1)
+        loadCfg()
+    end)
+end) then
+    loadErrors = loadErrors + 1
 end
 
 ----------------------------------------------------------------------
@@ -4237,6 +4950,6 @@ task.spawn(function()
         and getPlayersFolder() ~= nil
         and loadErrors == 0
     if allGood then
-        print("FuzzyHook - dev build has loaded without any errors may have issues")
+        print("FuzzyHook - PRIVATE has loaded without any errors")
     end
 end)
