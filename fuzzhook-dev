@@ -110,7 +110,7 @@ local LOOT_INCLUDE_SELF = true  -- also list your own loot
 local LOOT_ITEMS = {
     "FlareGun", "Reapir", "SOCOM556", "PEQ15", "HSPV", "TitanShield", "Mag556Rnd100",
     "TFZ98S", "CatToken", "ThermalModule", "R700", "338AP", "Gold50g",
-    "JPC", "IOTV4", "M4", "AsVal",
+    "JPC", "IOTV4", "M4", "AsVal","RK2",
 }
 
 -- Inv Aim item list. Only items written here are ever shown; anything else in an
@@ -465,6 +465,7 @@ WeddingRing
 MikeShades
 Football
 Teapot
+RK2
 
 ! Stims !
 SerumGreen
@@ -4141,7 +4142,7 @@ do
         { cat = "Weapons",        on = "wtc_weapons",  col = "wtc_weapons_col", def = { 1.0, 0.39, 0.39 }, items = [[
             ADAR15 AKM AKMN AsVal FAL Groza IZh12 IZh81 M4 MK23 Makarov Mosin MP443 MP5SD NagantRevolver
             PKM PPSH41 R700 RPG7 SKS SVD Saiga12 TFZ0 TFZ98S TOZ106 TT33 VZ61
-            F1 Fuze M84 RGD5 RGO MON50 PMN2 Snowball ]] },
+            F1 Fuze M84 RGD5 RGO MON50 PMN2 Snowball RK2 ]] },
         { cat = "Armor",          on = "wtc_armor",    col = "wtc_armor_col", def = { 0.39, 0.63, 1.0 }, items = [[
             6B2 6B23 6B27 6B43 6B47 6B5 Altyn AltynVisor ConcealedVest DozerArmor FastMT FastVisor
             HSPV IOTV4 JPC LegArmor Lvl4Plate MaskaVisor MotorcycleHelmet MotorcycleHelmetVisor LowCutVisor
