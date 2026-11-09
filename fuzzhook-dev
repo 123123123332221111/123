@@ -110,7 +110,7 @@ local LOOT_INCLUDE_SELF = true  -- also list your own loot
 local LOOT_ITEMS = {
     "FlareGun", "Reapir", "SOCOM556", "PEQ15", "HSPV", "TitanShield", "Mag556Rnd100",
     "TFZ98S", "CatToken", "ThermalModule", "R700", "338AP", "Gold50g",
-    "JPC", "IOTV4", "M4", "AsVal","RK2",
+    "JPC", "IOTV4", "M4", "AsVal",
 }
 
 -- Inv Aim item list. Only items written here are ever shown; anything else in an
@@ -465,7 +465,6 @@ WeddingRing
 MikeShades
 Football
 Teapot
-RK2
 
 ! Stims !
 SerumGreen
@@ -770,6 +769,7 @@ end
 local IMPORTANT_TOGGLES = {
     { id = "opt_two",       label = "Report Alert", default = false, cb = printToggle("Report Alert") },
     { id = "opt_stafflist", label = "Staff Alert",  default = true,  cb = printToggle("Staff Alert") },
+    { id = "opt_known",     label = "Known Staff Detector", default = true, cb = printToggle("Known Staff Detector") },
     { id = "opt_info",      label = "Player Info",  default = true,  cb = printToggle("Player Info") },
     { id = "opt_teams",     label = "View Player Teams", default = true, cb = printToggle("View Player Teams") },
     { id = "opt_modtag",    label = "Moderator Tag", default = true, cb = printToggle("Moderator Tag") },
@@ -908,6 +908,8 @@ UI.AddTab("FuzzyHook - PRIVATE", function(tab)
     settings:SliderFloat("ui_opacity", "UI Opacity", 0.3, 1.0, DEFAULT_OPACITY, "%.2f")
     settings:SliderInt("dropesp_textsize", "Item ESP Text Size", 8, 30, 14)
     settings:Toggle("opt_perf", "Performance Mode", false)
+    settings:Toggle("opt_known_alert", "Staff Repository Alert", true)
+    settings:Tip("Shows a notification when the known staff list has loaded: how many names and how long it took")
     settings:Toggle("opt_icons_off", "Disable Icon Loading", false)
     settings:Tip("If enabled disable loading the icons from the github repo for performance, re enable if you want icons again")
     settings:Tip("Disables the Hotbar fade and notification slide animations")
@@ -1294,13 +1296,16 @@ RunService.RenderStepped:Connect(function()
             if mode == "god" then
                 d.Text = "God Moded"
                 d.Color = GOD_COLOR
+            elseif mode == "known" then
+                d.Text = "DO NOT SHOOT!!!!!!" -- player is on the Known Staff list (repo)
+                d.Color = GOD_COLOR
             else
                 d.Text = "[POSSIBLE MOD]"
                 d.Color = Color3.fromRGB(255, 0, 0)
             end
         end
 
-        if part and (mode == "god" or modTagOn) then
+        if part and (mode == "god" or modTagOn) then -- ("known" follows the Moderator Tag toggle too)
             local pos, onScreen = WorldToScreen(part.Position + LABEL_OFFSET)
             if onScreen then
                 d.Position = Vector2.new(pos.X, pos.Y - 7)
@@ -3241,6 +3246,13 @@ do
     local godSeen = {}       -- [name] = last GodMode state read (true / false), nil = never read
     local godGV = {}         -- [name] = cached Status.GameplayVariables instance
     local staffDirty = true
+    -- Known Staff Detector: accounts from the staff-accounts repo (UserId list; names only for lines
+    -- without an id). Kept in one table to save local variables.
+    --   ids[userId] = name | names[lowerName] = true | set[name] = true while that player is in the server
+    --   checked[name] = list version the player was checked against | ver changes when the list reloads
+    local K = { url = "https://raw.githubusercontent.com/123123123332221111/-staff-accounts-/refs/heads/main/user%2Bid",
+        ids = {}, names = {}, set = {}, checked = {}, ver = 0, ready = false, at = -1e9, sig = nil,
+        tagOn = true, on = false }
     local staffWasOn = false
 
     -- Default spot: directly under the Boss Tracker (same left edge, 10px below its bottom).
@@ -3324,14 +3336,17 @@ do
         for name in pairs(godSet) do
             if not staffSet[name] then names[#names + 1] = name end
         end
+        for name in pairs(K.set) do
+            if not staffSet[name] and not godSet[name] then names[#names + 1] = name end
+        end
         table.sort(names)
 
         local total = #names
         local n = (total < SL_MAX_ROWS) and total or SL_MAX_ROWS
         for i = 1, n do
             local nm = names[i]
-            local god = godSet[nm] == true
-            local text = god and (nm .. " - God Mode") or nm
+            local god = K.set[nm] == true or godSet[nm] == true -- orange: known staff or God Mode
+            local text = (godSet[nm] == true and K.set[nm] ~= true) and (nm .. " - God Mode") or nm
             if total > SL_MAX_ROWS and i == SL_MAX_ROWS then
                 text = "+" .. (total - SL_MAX_ROWS + 1) .. " more"
                 god = false
@@ -3368,7 +3383,9 @@ do
     -- (You never get a label over yourself.)
     local function refreshLabel(name)
         if name == LOCAL_NAME then return end
-        if godSet[name] then
+        if K.set[name] then
+            modTargets[name] = "known"
+        elseif godSet[name] then
             modTargets[name] = "god"
         elseif staffSet[name] then
             modTargets[name] = true
@@ -3438,7 +3455,9 @@ do
                     staffDirty = true
                     if not isMe then
                         refreshLabel(name) -- [POSSIBLE MOD] label (or "God Moded" if GodMode is on)
-                        Notification.push("Staff Detector", name .. " has " .. STAFF_LABEL, STAFF_NOTIFY)
+                        if not K.set[name] then -- (a known staff member already got its own notification)
+                            Notification.push("Staff Detector", name .. " has " .. STAFF_LABEL, STAFF_NOTIFY)
+                        end
                     end
                 end
             elseif res == false then
@@ -3468,11 +3487,44 @@ do
         for _, plr in ipairs(Players:GetPlayers()) do
             local name = plr.Name
             present[name] = true
-            if not staffChecked[name] and staffPending[name] == nil then
-                staffPending[name] = 0
+            if K.tagOn then
+                if not staffChecked[name] and staffPending[name] == nil then
+                    staffPending[name] = 0
+                end
+                if godNow or godSeen[name] == nil then
+                    checkGod(name)
+                end
             end
-            if godNow or godSeen[name] == nil then
-                checkGod(name)
+            -- Known Staff Detector: each player is compared with the repo list once per list version
+            if K.on and K.ready and K.checked[name] ~= K.ver then
+                K.checked[name] = K.ver
+                local hit = K.ids[plr.UserId] ~= nil or K.names[string.lower(name)] == true
+                if hit and not K.set[name] then
+                    local isMe = (name == LOCAL_NAME)
+                    if not isMe or STAFF_LIST_INCLUDE_SELF then
+                        K.set[name] = true
+                        staffDirty = true
+                        refreshLabel(name)
+                        if not isMe then
+                            Notification.push("Known Staff Detector", name .. " is KNOWN STAFF - DO NOT SHOOT!", STAFF_NOTIFY)
+                        end
+                    end
+                elseif not hit and K.set[name] then
+                    K.set[name] = nil -- the list changed and they are no longer on it
+                    staffDirty = true
+                    refreshLabel(name)
+                end
+            end
+        end
+
+        for name in pairs(K.checked) do
+            if not present[name] then
+                K.checked[name] = nil
+                if K.set[name] then
+                    K.set[name] = nil
+                    staffDirty = true
+                end
+                modTargets[name] = nil
             end
         end
 
@@ -3501,14 +3553,27 @@ do
             end
         end
 
-        processStaffPending()
+        if K.tagOn then processStaffPending() end
     end
 
     -- Worker (once a second while the list is on): picks up joins/leaves, retries
     -- pending players, and redraws only when something changed
     local function staffStep()
-        local on = slOK and UI.GetValue("opt_stafflist")
+        -- Staff Alert (tag detector) and Known Staff Detector run independently; the panel is shown while
+        -- either is on. Flipping one of them starts a clean rescan.
+        local tagOn = UI.GetValue("opt_stafflist") == true
+        local knownOn = UI.GetValue("opt_known") == true
+        local on = slOK and (tagOn or knownOn)
         if on then
+            local sig = (tagOn and 1 or 0) + (knownOn and 2 or 0)
+            if K.sig ~= sig then
+                K.sig = sig
+                staffSet, staffChecked, staffPending, modTargets = {}, {}, {}, {}
+                godSet, godSeen, godGV = {}, {}, {}
+                K.set, K.checked = {}, {}
+                staffDirty = true
+            end
+            K.tagOn, K.on = tagOn, knownOn
             syncStaff()
             setStaffPanelVisible(true)
             if staffDirty then
@@ -3520,6 +3585,7 @@ do
                 -- turned off: reset everything so a fresh scan runs when it is turned back on
                 staffSet, staffChecked, staffPending, modTargets = {}, {}, {}, {}
                 godSet, godSeen, godGV = {}, {}, {}
+                K.set, K.checked, K.sig = {}, {}, nil
             end
             setStaffPanelVisible(false)
         end
@@ -3530,6 +3596,63 @@ do
         while true do
             guarded(staffStep, "staff list step (1/s)")
             wait(1)
+        end
+    end)
+
+    -- Downloads the known-staff list while the toggle is on: retried every 60 s until it works,
+    -- then refreshed every 10 minutes. A failed download keeps the old list.
+    task.spawn(function()
+        while true do
+            if UI.GetValue("opt_known") == true and tick() - K.at >= (K.ready and 600 or 60) then
+                K.at = tick()
+                local t0 = K.at
+                local first = not K.ready
+                local ok, body = pcall(function()
+                    if httpget then return httpget(K.url) end
+                    return game:HttpGet(K.url)
+                end)
+                if ok and type(body) == "string" and #body > 0 then
+                    local ids, names, n, lines = {}, {}, 0, 0
+                    for line in string.gmatch(body, "[^\r\n]+") do
+                        lines = lines + 1
+                        local nm, id = string.match(line, "^%s*([%w_]+)%s*[,;%s]%s*(%d+)%s*$")
+                        if nm then
+                            ids[tonumber(id)] = nm
+                            n = n + 1
+                        else
+                            local only = string.match(line, "^%s*([%w_]+)%s*$")
+                            if only then
+                                names[string.lower(only)] = true
+                                n = n + 1
+                            end
+                        end
+                    end
+                    if n > 0 then
+                        K.ids, K.names, K.ready = ids, names, true
+                        K.ver = K.ver + 1 -- every player is compared with the new list
+                        print("[Known Staff] list loaded: " .. n .. " accounts")
+                        -- alert once per script run (not on the 10-minute refreshes): did every name load, and how long it took
+                        if first and UI.GetValue("opt_known_alert") ~= false then
+                            local secs = string.format("%.2f", tick() - t0)
+                            if n == lines then
+                                Notification.push("Staff Repository", "Loaded all " .. n .. " names in " .. secs .. "s",
+                                    { seconds = 8, color = Color3.fromRGB(80, 200, 120) })
+                            else
+                                Notification.push("Staff Repository", "Loaded " .. n .. " of " .. lines .. " lines in " .. secs
+                                    .. "s (" .. (lines - n) .. " unreadable)", { seconds = 12, color = Color3.fromRGB(255, 170, 0) })
+                            end
+                        end
+                    end
+                elseif not K.ready then
+                    print("[Known Staff] could not download the list yet (retrying every 60 s)")
+                    if not K.failShown and UI.GetValue("opt_known_alert") ~= false then
+                        K.failShown = true
+                        Notification.push("Staff Repository", "Could not load the list, retrying every 60s",
+                            { seconds = 10, color = Color3.fromRGB(255, 80, 80) })
+                    end
+                end
+            end
+            wait(K.ready and 5 or 1)
         end
     end)
 end
@@ -4142,7 +4265,7 @@ do
         { cat = "Weapons",        on = "wtc_weapons",  col = "wtc_weapons_col", def = { 1.0, 0.39, 0.39 }, items = [[
             ADAR15 AKM AKMN AsVal FAL Groza IZh12 IZh81 M4 MK23 Makarov Mosin MP443 MP5SD NagantRevolver
             PKM PPSH41 R700 RPG7 SKS SVD Saiga12 TFZ0 TFZ98S TOZ106 TT33 VZ61
-            F1 Fuze M84 RGD5 RGO MON50 PMN2 Snowball RK2 ]] },
+            F1 Fuze M84 RGD5 RGO MON50 PMN2 Snowball ]] },
         { cat = "Armor",          on = "wtc_armor",    col = "wtc_armor_col", def = { 0.39, 0.63, 1.0 }, items = [[
             6B2 6B23 6B27 6B43 6B47 6B5 Altyn AltynVisor ConcealedVest DozerArmor FastMT FastVisor
             HSPV IOTV4 JPC LegArmor Lvl4Plate MaskaVisor MotorcycleHelmet MotorcycleHelmetVisor LowCutVisor
