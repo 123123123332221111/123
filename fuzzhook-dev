@@ -7,8 +7,8 @@
 --  * Every panel (Player Info, Inv Aim, Staff List, Hotbar, Server Loot) is draggable
 --    by its top bar. Panels and notification boxes use the "UI Opacity" slider.
 --  * No text has a stroke / outline.
---  * Nothing prints to the console except one line at the very end, and only
---    if everything loaded without a problem.
+--  * Console: one "finished loading in mm:ss.cc" line as soon as everything is ready, or
+--    the caught error(s) with their Lua line if something failed.
 --  * God Mode detection lives inside the Staff List block (it shares that block's
 --    scan loop, so it is controlled by the "Staff Alert" toggle).
 --  * Performance Mode (Settings section) turns off the Hotbar fade and the
@@ -47,7 +47,7 @@ local loadErrors = 0
 -- Off by default. While off, guarded() costs one table lookup extra and nothing is recorded.
 -- While on, every named guarded() call / timed section adds its run time to FZPROF.s[name].
 -- (a global table on purpose: it needs no local-variable slot in the main chunk)
-FZPROF = { on = false, s = {} }
+FZPROF = { on = false, s = {}, t0 = tick(), errs = {}, seen = {}, done = false }
 FZPROF.add = function(name, dt)
     local s = FZPROF.s[name]
     if not s then
@@ -59,17 +59,33 @@ FZPROF.add = function(name, dt)
     if dt > s.max then s.max = dt end
 end
 
+-- Error report: every caught error is remembered (max 5 different ones). Before the "finished loading"
+-- line they are printed together with it; afterwards each new one is printed as soon as it happens.
+-- Lua error text contains the line, e.g. "Matcha:1234: attempt to index nil with 'Connect'".
+FZPROF.fail = function(where, err)
+    loadErrors = loadErrors + 1
+    local P = FZPROF
+    local msg = "[" .. where .. "] " .. tostring(err)
+    if not P.seen[msg] and #P.errs < 5 then
+        P.seen[msg] = true
+        P.errs[#P.errs + 1] = msg
+        if P.done then
+            print("FuzzyHook has detected an Error, please restart the script or @ the creator. " .. msg)
+        end
+    end
+end
+
 local function guarded(fn, name)
     local P = FZPROF
     if P.on and name then
         local t0 = tick()
-        local ok = pcall(fn)
+        local ok, err = pcall(fn)
         P.add(name, tick() - t0)
-        if not ok then loadErrors = loadErrors + 1 end
+        if not ok then P.fail(name, err) end
         return
     end
-    local ok = pcall(fn)
-    if not ok then loadErrors = loadErrors + 1 end
+    local ok, err = pcall(fn)
+    if not ok then P.fail(name or "background task", err) end
 end
 
 -- Staff detection: game.Players.<name> has the attributes SpecialChatTag = "Early Access" and/or
@@ -78,7 +94,7 @@ local STAFF_LABEL = "Early Access"
 
 local TICK_SECONDS = 0.5       -- main loop interval
 local LABEL_OFFSET = Vector3.new(0, 3.2, 0)
-local GOD_COLOR = Color3.fromRGB(255, 140, 0) -- orange: "God Moded" label + God Mode rows in the Staff List
+local GOD_COLOR = Color3.fromRGB(255, 165, 20) -- orange: "God Moded" label + God Mode rows in the Staff List
 local INFO_RADIUS = 150        -- px from screen center a player must be within to count as "looked at"
 local INFO_SELECT_EVERY = 0.1  -- how often the looked-at player is re-picked (seconds)
 local INFO_REFRESH = 2         -- how often the looked-at player's stats are re-read (seconds)
@@ -689,7 +705,7 @@ do
             n.t0 = tick() - (Notification.perf and SLIDE_TIME or 0)
             notes[#notes + 1] = n
         else
-            loadErrors = loadErrors + 1
+            FZPROF.fail("notification box", "could not be drawn")
             destroyNote(n) -- removes anything half-built and frees the slot
             -- the box could not be drawn: fall back to Matcha's own notification
             pcall(function() notify(message, title, seconds) end)
@@ -1183,7 +1199,7 @@ task.spawn(function()
         local pt = FZPROF.on and tick()
         local ok, count = pcall(readReports)
         if pt then FZPROF.add("report count read (2/s)", tick() - pt) end
-        if not ok then loadErrors = loadErrors + 1 end
+        if not ok then FZPROF.fail("report count read", count) end
 
         if ok and type(count) == "number" then
             setReportText(tostring(count))
@@ -1230,13 +1246,14 @@ local function makeModLabel()
         d.Font = Drawing.Fonts.SystemBold
         d.Size = 12
         d.Center = true
-        d.Outline = false
+        d.Outline = true -- faint stroke so the tag stays readable on any background
         d.Visible = false
     end)
     if not ok then
         pcall(function() d:Remove() end)
         return nil
     end
+    pcall(function() d.OutlineColor = Color3.fromRGB(20, 20, 20) end) -- (optional property: a failure here is ignored)
     return d
 end
 
@@ -3206,8 +3223,13 @@ end
 
 task.spawn(function()
     while true do
-        guarded(infoStep, "info/inv/hotbar step (10/s)")
-        wait(INFO_SELECT_EVERY)
+        local t0 = tick()
+        guarded(infoStep, "info/inv/hotbar step (adaptive)")
+        -- PERFORMANCE: the pause grows with the step's cost so it uses about 5% of the time at most:
+        -- 10 runs/s while it is cheap, down to ~1.6/s while it is slow (lag spikes)
+        local d = (tick() - t0) * 20
+        if d < INFO_SELECT_EVERY then d = INFO_SELECT_EVERY elseif d > 0.6 then d = 0.6 end
+        wait(d)
     end
 end)
 
@@ -3234,7 +3256,9 @@ do
     -- The panel is top-anchored (under the Boss Tracker): it grows downward as names are added.
     ----------------------------------------------------------------------
     local STAFF_LIST_INCLUDE_SELF = true -- TEST: lets you see yourself in the list; set to false later
-    local SL_MAX_ROWS = 10
+    local SL_MAX_ROWS = 10   -- names listed
+    local SL_MAX_LINES = 24  -- text lines available (a long entry wraps onto extra lines)
+    local SL_WRAP = 24       -- characters per line before the text wraps down
     local SL_ROW_H = 16
     local SL_W = 200 -- same width as the Boss Tracker so it lines up under it (and stays clear of Server Loot)
     local SL_MAX_TRIES = 6   -- scans (1 per second) to wait for the tag attributes of a new player
@@ -3259,8 +3283,9 @@ do
     -- The Boss Tracker is 36 + 6 rows * 16 + 6 = 138px tall and starts at y = 20, so this panel
     -- starts at y = 168 and grows DOWNWARD as names are added.
     local slPanel = newPanel("staff", math.floor(Workspace.CurrentCamera.ViewportSize.X - 200 - 20 - 10 - 200), 168, SL_W, 28)
-    local slRows, slRowText, slRowGod = {}, {}, {}
+    local slRows, slRowText, slRowGod, slRowIt = {}, {}, {}, {}
     local slBg, slDot, slTitle, slSep, slCount
+    local slWarn, slWarnIt = {}, {} -- two text lines: warning shown while the staff repository could not be loaded
     local slCountText = ""
     local slVisible = false
 
@@ -3285,16 +3310,25 @@ do
             Font = Drawing.Fonts.SystemBold, Size = 13,
             ZIndex = 2, Visible = false,
         }, 12, 30)
+        for i = 1, 2 do
+            slWarn[i] = addItem(slPanel, "Text", {
+                Text = (i == 1) and "Unable to load the" or "Staff Repository", Color = Color3.fromRGB(255, 130, 130),
+                Font = Drawing.Fonts.SystemBold, Size = 13,
+                ZIndex = 2, Visible = false,
+            }, 12, 30 + (i - 1) * 16)
+            slWarnIt[i] = slPanel.items[#slPanel.items]
+        end
         slSep = addItem(slPanel, "Square", {
             Filled = true, Color = Color3.fromRGB(80, 80, 92),
             Size = Vector2.new(SL_W - 24, 1), ZIndex = 2, Visible = false,
         }, 12, 50)
-        for i = 1, SL_MAX_ROWS do
+        for i = 1, SL_MAX_LINES do
             slRows[i] = addItem(slPanel, "Text", {
                 Text = "", Color = Color3.fromRGB(190, 190, 200),
                 Font = Drawing.Fonts.System, Size = 13,
                 ZIndex = 2, Visible = false,
             }, 12, 58 + (i - 1) * SL_ROW_H)
+            slRowIt[i] = slPanel.items[#slPanel.items] -- its y offset is moved when entries wrap
         end
     end)
 
@@ -3303,25 +3337,25 @@ do
         slRows = {}
     end
 
-    -- Panel height follows the number of names; positions are only rewritten when the list changes.
-    local function layoutStaffPanel(n, total)
-        -- title row, then (only when staff is detected) "Staff Detected (x)", separator and names
-        local H = (n > 0) and (58 + n * SL_ROW_H + 6) or 28
+    -- Panel height follows the text: a long entry wraps onto extra lines (like a chat message) and the
+    -- panel grows downward. Positions are only rewritten when the list changes.
+    -- nLines = text lines in use, H = panel height for them, total = number of staff.
+    local function layoutStaffPanel(nLines, total, H)
         slPanel.h = H
         slBg.Size = Vector2.new(SL_W, H)
 
-        if n > 0 then
+        if nLines > 0 then
             local text = "Staff Detected (" .. total .. ")"
             if text ~= slCountText then
                 slCountText = text
                 slCount.Text = text
             end
         end
-        slCount.Visible = n > 0
-        slSep.Visible = n > 0
+        slCount.Visible = nLines > 0
+        slSep.Visible = nLines > 0
 
-        for i = 1, SL_MAX_ROWS do
-            slRows[i].Visible = (i <= n)
+        for i = 1, SL_MAX_LINES do
+            slRows[i].Visible = (i <= nLines)
         end
 
         placePanel(slPanel) -- top edge stays put, so the panel grows downward
@@ -3343,24 +3377,59 @@ do
 
         local total = #names
         local n = (total < SL_MAX_ROWS) and total or SL_MAX_ROWS
+        local lines, y = 0, 58
         for i = 1, n do
             local nm = names[i]
             local god = K.set[nm] == true or godSet[nm] == true -- orange: known staff or God Mode
-            local text = (godSet[nm] == true and K.set[nm] ~= true) and (nm .. " - God Mode") or nm
+            local text = nm
+            if K.set[nm] == true then
+                text = nm .. ", known mod account!"
+            elseif godSet[nm] == true then
+                text = nm .. " - God Mode"
+            end
             if total > SL_MAX_ROWS and i == SL_MAX_ROWS then
                 text = "+" .. (total - SL_MAX_ROWS + 1) .. " more"
                 god = false
             end
-            if slRowText[i] ~= text then
-                slRowText[i] = text
-                slRows[i].Text = text
+
+            -- wrap: break at the last space that still fits SL_WRAP characters; continuation lines are indented
+            local rest, first = text, true
+            while #rest > 0 and lines < SL_MAX_LINES do
+                local cut = #rest
+                if cut > SL_WRAP then
+                    cut = SL_WRAP
+                    for k = SL_WRAP + 1, 2, -1 do
+                        if string.sub(rest, k, k) == " " then cut = k - 1 break end
+                    end
+                end
+                local piece = string.sub(rest, 1, cut)
+                rest = (string.gsub(string.sub(rest, cut + 1), "^%s+", ""))
+                if not first then piece = "  " .. piece end
+                first = false
+
+                lines = lines + 1
+                if slRowText[lines] ~= piece then
+                    slRowText[lines] = piece
+                    slRows[lines].Text = piece
+                end
+                if slRowGod[lines] ~= god then
+                    slRowGod[lines] = god
+                    slRows[lines].Color = god and GOD_COLOR or Color3.fromRGB(190, 190, 200)
+                end
+                slRowIt[lines].oy = y
+                y = y + SL_ROW_H
             end
-            if slRowGod[i] ~= god then
-                slRowGod[i] = god
-                slRows[i].Color = god and GOD_COLOR or Color3.fromRGB(190, 190, 200)
-            end
+            y = y + 4 -- small gap between entries so wrapped text does not blend into the next name
         end
-        layoutStaffPanel(n, total)
+        -- repository warning: under the names (or right under the title when nobody is listed)
+        local H = (lines > 0) and (y + 2) or 28
+        if K.failed then
+            local wy = (lines > 0) and y or 30
+            slWarnIt[1].oy, slWarnIt[2].oy = wy, wy + SL_ROW_H
+            H = wy + 2 * SL_ROW_H + 6
+        end
+        slWarn[1].Visible, slWarn[2].Visible = K.failed == true, K.failed == true
+        layoutStaffPanel(lines, total, H)
     end
 
     local function setStaffPanelVisible(v)
@@ -3373,7 +3442,8 @@ do
         if not v then
             slCount.Visible = false
             slSep.Visible = false
-            for i = 1, SL_MAX_ROWS do slRows[i].Visible = false end
+            for i = 1, SL_MAX_LINES do slRows[i].Visible = false end
+            slWarn[1].Visible, slWarn[2].Visible = false, false
         else
             staffDirty = true -- redraw rows when the panel is shown again
         end
@@ -3594,8 +3664,12 @@ do
 
     task.spawn(function()
         while true do
-            guarded(staffStep, "staff list step (1/s)")
-            wait(1)
+            local t0 = tick()
+            guarded(staffStep, "staff list step (adaptive)")
+            -- once a second while cheap; the pause grows with the step's cost (about 5% of the time at most, 3 s max)
+            local d = (tick() - t0) * 20
+            if d < 1 then d = 1 elseif d > 3 then d = 3 end
+            wait(d)
         end
     end)
 
@@ -3607,6 +3681,7 @@ do
                 K.at = tick()
                 local t0 = K.at
                 local first = not K.ready
+                local loaded = false
                 local ok, body = pcall(function()
                     if httpget then return httpget(K.url) end
                     return game:HttpGet(K.url)
@@ -3628,6 +3703,7 @@ do
                         end
                     end
                     if n > 0 then
+                        loaded = true
                         K.ids, K.names, K.ready = ids, names, true
                         K.ver = K.ver + 1 -- every player is compared with the new list
                         print("[Known Staff] list loaded: " .. n .. " accounts")
@@ -3643,13 +3719,21 @@ do
                             end
                         end
                     end
-                elseif not K.ready then
-                    print("[Known Staff] could not download the list yet (retrying every 60 s)")
-                    if not K.failShown and UI.GetValue("opt_known_alert") ~= false then
-                        K.failShown = true
-                        Notification.push("Staff Repository", "Could not load the list, retrying every 60s",
-                            { seconds = 10, color = Color3.fromRGB(255, 80, 80) })
+                end
+
+                if loaded then
+                    if K.failed then
+                        K.failed, K.failShown = false, false
+                        staffDirty = true -- removes the warning from the Staff List
                     end
+                elseif not K.ready and not K.failShown then
+                    -- could not download (or the file had no readable accounts): one alert per failure
+                    -- episode, retried every 60 s in the background. A failed REFRESH keeps the old list.
+                    K.failShown, K.failed = true, true
+                    staffDirty = true -- shows the warning in the Staff List
+                    print("Unable to load the Staff Repository")
+                    Notification.push("Staff Repository", "Unable to load the Staff Repository",
+                        { seconds = 30, color = Color3.fromRGB(255, 130, 130) })
                 end
             end
             wait(K.ready and 5 or 1)
@@ -3866,7 +3950,8 @@ do
                     lootLastScan = now
 
                     local names = {}
-                    if not pcall(lootGetNames, names) then loadErrors = loadErrors + 1 end
+                    local okN, errN = pcall(lootGetNames, names)
+                    if not okN then FZPROF.fail("loot player list", errN) end
 
                     local results = {}
                     for i = 1, #names do
@@ -3874,7 +3959,7 @@ do
                         local ok, counts = pcall(lootScanPlayer, names[i])
                         if pt then FZPROF.add("loot scan, one player", tick() - pt) end
                         if not ok then
-                            loadErrors = loadErrors + 1
+                            FZPROF.fail("loot scan", counts)
                         elseif counts then
                             results[#results + 1] = { name = names[i], counts = counts }
                         end
@@ -3983,25 +4068,52 @@ do
     local found = {}   -- [index] = true while that boss exists (reused every scan)
     local bossUp = {}  -- [index] = last known state (nil = not scanned yet)
 
-    -- Marks every boss that has a direct child of `parent` with its name
-    local function scanParent(parent)
-        local kids = parent:GetChildren()
-        for i = 1, #kids do
-            local idx = BOSS_KEY[norm(kids[i].Name)]
-            if idx then found[idx] = true end
+    -- PERFORMANCE: the old scan walked EVERY child of Workspace (thousands of objects) each time, and
+    -- FindFirstChild on Workspace itself is slow too, so Workspace is NOT searched by default. Each boss
+    -- name is looked up directly inside the folders in BOSS_FOLDERS; resolved folders are cached.
+    local BOSS_SCAN_WORKSPACE = false   -- true = also look for the boss names directly in Workspace (slow)
+    local bossRoots = {}                -- [path] = folder instance (cached)
+    local BOSS_CAND = {}                -- [index] = { exact name, symbol-free name }
+    for i = 1, #BOSS_NAMES do
+        local c = { BOSS_NAMES[i] }
+        local plain = string.gsub(BOSS_NAMES[i], "[^%w]", "")
+        if plain ~= BOSS_NAMES[i] and plain ~= "" then c[2] = plain end
+        BOSS_CAND[i] = c
+    end
+
+    local function scanRoot(root)
+        for i = 1, #BOSS_NAMES do
+            if not found[i] then
+                local c = BOSS_CAND[i]
+                for k = 1, #c do
+                    local o = root:FindFirstChild(c[k])
+                    if o ~= nil and o.Name ~= "Unreadable_name" then
+                        found[i] = true
+                        break
+                    end
+                end
+            end
         end
+    end
+
+    local function resolveFolder(path)
+        local f = bossRoots[path]
+        if f ~= nil and f.Parent ~= nil then return f end
+        f = Workspace
+        for part in string.gmatch(path, "[^/]+") do
+            f = f:FindFirstChild(part)
+            if f == nil or f.Name == "Unreadable_name" then f = nil break end
+        end
+        bossRoots[path] = f
+        return f
     end
 
     local function scanBosses()
         for i = 1, #BOSS_NAMES do found[i] = false end
-        scanParent(Workspace)
+        if BOSS_SCAN_WORKSPACE then scanRoot(Workspace) end
         for i = 1, #BOSS_FOLDERS do
-            local f = Workspace
-            for part in string.gmatch(BOSS_FOLDERS[i], "[^/]+") do
-                f = f:FindFirstChild(part)
-                if f == nil or f.Name == "Unreadable_name" then f = nil break end
-            end
-            if f then scanParent(f) end
+            local f = resolveFolder(BOSS_FOLDERS[i])
+            if f then scanRoot(f) end
         end
     end
 
@@ -4184,9 +4296,10 @@ end)
 -- Corpse ESP: a Model in the same folder that is not a listed item but holds a Humanoid is a corpse.
 ----------------------------------------------------------------------
 do
-    local ESP_MAX = 60           -- most items drawn at once (the nearest ones)
+    local ESP_MAX = 40           -- most items drawn at once (the nearest ones); corpses use half of it
     local ESP_SCAN_EVERY = 1     -- seconds between scans of Workspace.DroppedItems
-    local ESP_SCAN_CAP = 3000    -- safety cap on objects looked at per scan
+    local ESP_SCAN_CAP = 20000   -- safety cap on objects looked at per scan (names are checked first, so this is cheap)
+    local ESP_SLICE = 0.008      -- seconds of scan work before it pauses one frame (no single long freeze)
     local ESP_COLOR = Color3.fromRGB(255, 255, 255)
     local ESP_OUTLINE = Color3.fromRGB(0, 0, 0)
     local ESP_FONT = Drawing.Fonts.ProximaSoftBold  -- try Drawing.Fonts.SystemBold / Monospace / Pixel / Minecraft
@@ -4401,16 +4514,19 @@ do
     end
 
     -- Corpse detection helpers (kept in one table to save local variables).
-    local CP = { no = {}, scan = 0, recheck = 10 }
+-- no = "not a corpse" notes, low = name -> lowercase, junk = names that are neither items, folders
+    -- nor Models (skipped without reading anything else), act = cached on/off state of the two ESPs,
+    -- last = numbers from the latest scan (for the debug button), bad = consecutive errors per task
+    local CP = { no = {}, low = {}, junk = {}, pos = {}, nh = {}, scan = 0, recheck = 120, every = ESP_SCAN_EVERY, heavy = false,
+        trips = 0, bad = {}, last = { cpu = 0, n = 0, items = 0, corpses = 0, wall = 0 },
+        act = { item = false, corpse = false, size = nil, at = 0 } }
     -- true when the object has a Humanoid child (matched by class or by name; GetChildren is used
     -- because it is known to work in Matcha)
     CP.hasHum = function(obj)
-        local kids = obj:GetChildren()
-        for i = 1, #kids do
-            local k = kids[i]
-            if k.ClassName == "Humanoid" or k.Name == "Humanoid" then return true end
-        end
-        return false
+        -- 1-2 calls instead of reading every child of a corpse (30+ parts)
+        if obj:FindFirstChild("Humanoid") ~= nil then return true end
+        local ok, h = pcall(function() return obj:FindFirstChildOfClass("Humanoid") end)
+        return ok and h ~= nil
     end
 
     -- Dropped objects can sit directly in the folder or inside sub-folders of it (like the example
@@ -4421,42 +4537,93 @@ do
         for i = 1, #kids do
             if state.n >= ESP_SCAN_CAP then return end
             state.n = state.n + 1
+            -- PERFORMANCE: the scan hands the frame back after every ESP_SLICE seconds of work (each
+            -- game-object read costs ~0.5-2 ms here), so it is spread over many frames instead of one
+            -- long freeze (cpu = time actually spent working, without the pauses)
+            local tn = tick()
+            if tn - state.t >= ESP_SLICE then
+                state.cpu = state.cpu + (tn - state.t)
+                task.wait()
+                state.t = tick()
+            end
             local obj = kids[i]
-            local cls = obj.ClassName
-            if state.items and espShown(string.lower(obj.Name)) then
-                -- the item itself (whatever class it is, e.g. DroppedItems.Pantsir3 with a child "Part")
-                local part = findPart(obj, cls)
-                local pp = part and part.Position
-                if pp then
-                    local dist = (pp - origin).Magnitude
-                    if dist <= range then
-                        found[#found + 1] = { part = part, name = obj.Name, dist = dist,
-                            col = pickColor(string.lower(obj.Name)), addr = obj.Address }
+            local nm = obj.Name
+            -- lower-casing (a new string) is done once per distinct name, not per object
+            local low = CP.low[nm]
+            if not low then
+                low = string.lower(nm)
+                CP.low[nm] = low
+            end
+            if espShown(low) then
+                if state.items then
+                    -- the item itself (whatever class it is, e.g. DroppedItems.Pantsir3 with a child "Part").
+                    -- Its part / position are remembered per object: dropped items do not move once they
+                    -- settled, so only the first 3 sightings read them (a falling item is still tracked).
+                    local addr = obj.Address
+                    local c = addr and CP.pos[addr]
+                    local part, pp
+                    if c and c.name == nm and c.seen >= 3 then
+                        part, pp = c.part, c.pos
+                    else
+                        part = findPart(obj, obj.ClassName)
+                        pp = part and part.Position
+                        if pp and addr then
+                            CP.pos[addr] = { name = nm, part = part, pos = pp, seen = (c and c.name == nm) and (c.seen + 1) or 1 }
+                        end
+                    end
+                    if pp then
+                        local dist = (pp - origin).Magnitude
+                        if dist <= range then
+                            found[#found + 1] = { part = part, wpos = pp, name = nm, dist = dist,
+                                col = pickColor(low), addr = addr }
+                        end
                     end
                 end
-            elseif cls == "Folder" then
+            elseif not CP.junk[nm] then
+              local cls = obj.ClassName
+              if cls == "Folder" then
                 if depth < 2 then collect(obj, depth + 1, found, origin, range, state) end
-            elseif state.corpses and cls == "Model" then
+              elseif cls ~= "Model" then
+                CP.junk[nm] = true -- loose parts / values: never looked at again until the next reset
+              elseif state.corpses then
                 -- a Model that is not a listed item but contains a Humanoid is a corpse. Models
                 -- without one are remembered for CP.recheck scans so the (huge) pile of junk is not
                 -- re-inspected every second.
                 local addr = obj.Address
                 local lastNo = addr and CP.no[addr]
                 if not (lastNo and state.scan - lastNo < CP.recheck) then
-                    if CP.hasHum(obj) then
-                        local part = findPart(obj, cls)
-                        local pp = part and part.Position
+                    local c = addr and CP.pos[addr]
+                    local isCorpse = c ~= nil and c.corpse == true and c.name == nm
+                    if not isCorpse then isCorpse = CP.hasHum(obj) end
+                    if isCorpse then
+                        local part, pp
+                        if c and c.corpse and c.name == nm and c.seen >= 3 then
+                            part, pp = c.part, c.pos
+                        else
+                            part = findPart(obj, cls)
+                            pp = part and part.Position
+                            if pp and addr then
+                                CP.pos[addr] = { name = nm, corpse = true, part = part, pos = pp,
+                                    seen = (c and c.corpse and c.name == nm) and (c.seen + 1) or 1 }
+                            end
+                        end
                         if pp then
                             local dist = (pp - origin).Magnitude
                             if dist <= state.crange then
-                                state.corpses[#state.corpses + 1] = { part = part, name = "[Corpse] " .. obj.Name,
+                                state.corpses[#state.corpses + 1] = { part = part, wpos = pp, name = "[Corpse] " .. nm,
                                     dist = dist, col = wtcColor["Corpse"], addr = addr, corpse = true }
                             end
                         end
-                    elseif addr then
-                        CP.no[addr] = state.scan
+                    else
+                        if addr then CP.no[addr] = state.scan end
+                        -- a name that turned out to be "no Humanoid" 3 times is skipped by name from now
+                        -- on (one read per object instead of three); player corpses are unique names
+                        local k = (CP.nh[nm] or 0) + 1
+                        CP.nh[nm] = k
+                        if k >= 3 then CP.junk[nm] = true end
                     end
                 end
+              end
             end
         end
     end
@@ -4495,10 +4662,28 @@ do
         return on
     end
 
+    -- Cached on/off state of both ESPs (toggle + keybind reads are several calls each and used to run
+    -- every frame). Refreshed at most 5 times a second; force = true reads them right now.
+    local function refreshActive(force)
+        local A = CP.act
+        local now = tick()
+        if not force and now - A.at < 0.2 then return A end
+        A.at = now
+        A.item = espActive()
+        A.corpse = corpseActive()
+        A.size = UI.GetValue("dropesp_textsize")
+        return A
+    end
+
     local function scanDropped()
-        local root = Workspace:FindFirstChild("DroppedItems")
-            or Workspace:FindFirstChild("RuntimeItems")
-            or Workspace:FindFirstChild("Drops")
+        -- each FindFirstChild on Workspace is slow, so the folder is cached until it goes away
+        local root = CP.root
+        if root == nil or root.Parent == nil then
+            root = Workspace:FindFirstChild("DroppedItems")
+                or Workspace:FindFirstChild("RuntimeItems")
+                or Workspace:FindFirstChild("Drops")
+            CP.root = root
+        end
         if not root then
             if entryCount > 0 then clearEntries() end
             return
@@ -4514,28 +4699,48 @@ do
         local range = UI.GetValue("dropesp_range") or 500
 
         -- items and corpses are found in the SAME walk of the folder
-        local itemOn, corpseOn = espActive(), corpseActive()
+        local A = refreshActive(true)
+        local itemOn, corpseOn = A.item, A.corpse
         CP.scan = CP.scan + 1
-        if CP.scan % 120 == 0 then CP.no = {} end -- forget old "not a corpse" notes now and then
+        if CP.scan % 600 == 0 then CP.no, CP.junk, CP.low, CP.pos, CP.nh = {}, {}, {}, {}, {} end -- rare: a reset costs one slow scan -- forget old notes now and then
         local found = {}
-        local state = { n = 0, items = itemOn, scan = CP.scan }
+        local t0 = tick()
+        local state = { n = 0, items = itemOn, scan = CP.scan, cpu = 0, t = t0 }
         if corpseOn then
             state.corpses = {}
             state.crange = UI.GetValue("corpseesp_range") or 500
         end
         collect(root, 1, found, origin, range, state)
+        state.cpu = state.cpu + (tick() - state.t)
 
+        -- label caps shrink while scans are heavy (CP.heavy is set below from the scan cost)
+        local maxItems = CP.heavy and (ESP_MAX // 2) or ESP_MAX
+        local maxCorp = maxItems // 2
         table.sort(found, function(a, b) return a.dist < b.dist end)
-        local n = (#found < ESP_MAX) and #found or ESP_MAX
+        local nItems = #found
+        local n = (nItems < maxItems) and nItems or maxItems
+        for i = n + 1, #found do found[i] = nil end -- keep only the nearest items
+        local nCorp = 0
         if state.corpses then
             local cs = state.corpses
+            nCorp = #cs
             table.sort(cs, function(a, b) return a.dist < b.dist end)
-            for i = n + 1, #found do found[i] = nil end -- keep only the nearest ESP_MAX items
-            for i = 1, (#cs < ESP_MAX) and #cs or ESP_MAX do
+            for i = 1, (nCorp < maxCorp) and nCorp or maxCorp do
                 found[#found + 1] = cs[i]
             end
             n = #found
         end
+
+        -- the scan interval grows with the scan cost (never above ~5% of the time, 8 s at most); a very
+        -- expensive scan (300 ms or more of real work) also halves the label caps until it gets cheap again
+        local L = CP.last
+        L.cpu, L.n, L.items, L.corpses, L.wall = state.cpu, state.n, nItems, nCorp, tick() - t0
+        local every = state.cpu * 20
+        if every < ESP_SCAN_EVERY then every = ESP_SCAN_EVERY end
+        if every > 8 then every = 8 end
+        CP.every = every
+        if state.cpu >= 0.3 then CP.heavy = true elseif state.cpu < 0.1 then CP.heavy = false end
+        if FZPROF.on then FZPROF.add("item/corpse ESP scan (cpu, without pauses)", state.cpu) end
 
         -- match the new results to the existing labels by instance Address
         local newList, seen = {}, {}
@@ -4544,7 +4749,7 @@ do
             local addr = f.addr
             local e = addr and byAddr[addr]
             if e then
-                e.part, e.dist, e.name, e.col = f.part, f.dist, f.name, f.col
+                e.part, e.wpos, e.dist, e.name, e.col = f.part, f.wpos, f.dist, f.name, f.col
                 e.colSet = false -- colour settings may have changed: write it again once
                 e.gone = 0
             else
@@ -4580,14 +4785,16 @@ do
     -- label that is briefly unreadable or off screen for 1-2 frames keeps showing at its last spot
     -- instead of blinking.
     local function espRender()
-        local itemOn, corpseOn = espActive(), corpseActive()
+        -- toggle / keybind / size are read from a cache refreshed 5 times a second
+        local A = refreshActive()
+        local itemOn, corpseOn = A.item, A.corpse
         if entryCount > 0 and not itemOn and not corpseOn then
             clearEntries() -- turned off (toggle or keybind): hide every label immediately
             return
         end
 
         -- "Item ESP Text Size" slider: applied to every label (and the spare ones) only when it changes
-        local sz = UI.GetValue("dropesp_textsize")
+        local sz = A.size
         if type(sz) == "number" and sz ~= espSize then
             espSize = sz
             for i = 1, #entries do entries[i].d.Size = sz end
@@ -4610,8 +4817,9 @@ do
             local d = e.d
             local show = false
 
-            local part = e.part
-            local pp = part and part.Position
+            -- dropped items and corpses do not move, so the position found by the scan is used (no
+            -- Part.Position bridge call per label per frame; a destroyed part cannot throw here either)
+            local pp = e.wpos
             -- a kind that was just switched off stays hidden until the next scan frees its labels
             if pp and (e.corpse and corpseOn or (not e.corpse and itemOn)) then
                 local pos, onScreen = WorldToScreen(pp)
@@ -4637,7 +4845,11 @@ do
                         d.Color = e.col or (HIGHLIGHT[e.name] == true and HIGHLIGHT_COLOR or ESP_COLOR)
                     end
 
-                    d.Position = Vector2.new(math.floor(pos.X + 0.5), math.floor(pos.Y - 7 + 0.5))
+                    local px, py = math.floor(pos.X + 0.5), math.floor(pos.Y - 6.5)
+                    if e.px ~= px or e.py ~= py then -- only written when the pixel position changed
+                        e.px, e.py = px, py
+                        d.Position = Vector2.new(px, py)
+                    end
                 end
             end
 
@@ -4769,6 +4981,19 @@ do
             if st.corpses == 0 and st.models > 0 then
                 print("[Drop debug] no Model had a Humanoid child; if corpses look different (e.g. no Humanoid), send me the corpse's children")
             end
+            local L = CP.last
+            print(string.format("[Drop debug] last scan: %d objects looked at | %.0f ms of real work (%.0f ms with pauses) | found %d items, %d corpses | next scan every %.1f s",
+                L.n, L.cpu * 1000, L.wall * 1000, L.items, L.corpses, CP.every))
+            print("[Drop debug] heavy mode (label caps halved) = " .. tostring(CP.heavy) .. " | label caps: items " .. (CP.heavy and ESP_MAX // 2 or ESP_MAX)
+                .. ", corpses " .. ((CP.heavy and ESP_MAX // 2 or ESP_MAX) // 2) .. " | spare label drawings = " .. #freeDraw
+                .. " | safety switch-offs = " .. CP.trips
+                .. " | remembered: " .. (function()
+                    local a, b, c = 0, 0, 0
+                    for _ in pairs(CP.junk) do a = a + 1 end
+                    for _ in pairs(CP.no) do b = b + 1 end
+                    for _ in pairs(CP.pos) do c = c + 1 end
+                    return a .. " skipped names, " .. b .. " not-corpse objects, " .. c .. " positions"
+                end)())
             print("[Drop debug] ESP state: scanned entries = " .. entryCount .. ", drawn on screen = " .. shownCount)
             if entryCount > 0 then
                 local e = entries[1]
@@ -4781,19 +5006,47 @@ do
         if not ok then print("[Drop debug] error: " .. tostring(err)) end
     end
 
+    -- Safety switch: if one of the ESP tasks keeps throwing errors, both ESPs are switched off (instead
+    -- of the error repeating every frame) with a notification and a console line. Toggle them back on
+    -- to try again.
+    local function espRun(fn, name, limit)
+        local P = FZPROF
+        local t0 = P.on and tick()
+        local ok, err = pcall(fn)
+        if t0 then P.add(name, tick() - t0) end
+        if ok then
+            CP.bad[name] = 0
+            return
+        end
+        P.fail(name, err)
+        local c = (CP.bad[name] or 0) + 1
+        CP.bad[name] = c
+        if c >= limit then
+            CP.bad[name] = 0
+            CP.trips = CP.trips + 1
+            pcall(UI.SetValue, "opt_dropesp", false)
+            pcall(UI.SetValue, "opt_corpseesp", false)
+            clearEntries()
+            print("[ESP] switched off after repeated errors in " .. name .. ": " .. tostring(err))
+            Notification.push("ESP", "Dropped Item / Corpse ESP switched off (errors, see console)",
+                { seconds = 10, color = Color3.fromRGB(255, 130, 130) })
+        end
+    end
+
     RunService.RenderStepped:Connect(function()
-        guarded(espRender, "item/corpse ESP render (per frame)")
+        espRun(espRender, "item/corpse ESP render (per frame)", 30)
     end)
 
     local wasActive, lastScanAt = false, 0
     task.spawn(function()
         while true do
-            local active = espActive() or corpseActive()
+            local A = refreshActive()
+            local active = A.item or A.corpse
             if active then
                 local now = tick()
-                if not wasActive or now - lastScanAt >= ESP_SCAN_EVERY then
-                    lastScanAt = now
-                    guarded(scanDropped, "item/corpse ESP scan (1/s)")
+                if not wasActive or now - lastScanAt >= CP.every then
+                    espRun(scanDropped, "item/corpse ESP scan (adaptive)", 3)
+                    lastScanAt = tick() -- the next scan is timed from the END of this one
                 end
             elseif entryCount > 0 then
                 clearEntries() -- off: hide and free every label
@@ -4867,7 +5120,7 @@ end
 -- (key + mode) and the position of every panel. Not saved: the debug toggles.
 -- (wrapped in a function so its locals do not count against the main chunk's 200-local limit)
 ----------------------------------------------------------------------
-if not pcall(function()
+do local okCfg, errCfg = pcall(function()
     local FILE = "FuzzyHook_config.json"
     local Http = game:GetService("HttpService")
     local NOTE = { seconds = 4, color = Color3.fromRGB(130, 110, 255) }
@@ -4950,7 +5203,15 @@ if not pcall(function()
             local kb = Notification[field]
             if kb then
                 local key, mode = kb:GetKey(), kb:GetType()
-                if type(key) == "number" then cfg.k[id] = { key, mode } end
+                if type(key) == "number" then
+                    cfg.k[id] = { key, mode }
+                elseif key ~= nil then
+                    -- the key can come back as an Enum.KeyCode (not a number): it is saved by its name
+                    local okN, nm = pcall(function() return key.Name end)
+                    if okN and type(nm) == "string" then cfg.k[id] = { nm, mode } end
+                end
+                print("[Config] keybind " .. id .. ": key=" .. tostring(key) .. " (" .. typeof(key) .. ") mode=" .. tostring(mode)
+                    .. " -> " .. (cfg.k[id] and "saved" or "NOT saved"))
             end
         end
         for i = 1, #panels do
@@ -4994,7 +5255,9 @@ if not pcall(function()
                 left = left + 1
             elseif type(kv) == "table" then
                 pcall(function()
-                    if kb:GetKey() ~= kv[1] then kb:SetKey(kv[1]) end
+                    local want = kv[1]
+                    if type(want) == "string" then want = Enum.KeyCode[want] end -- saved by name (Enum key)
+                    if want ~= nil and kb:GetKey() ~= want then kb:SetKey(want) end
                     if kv[2] and kb:GetType() ~= kv[2] then kb:SetType(kv[2]) end
                 end)
             end
@@ -5057,23 +5320,44 @@ if not pcall(function()
         wait(1)
         loadCfg()
     end)
-end) then
-    loadErrors = loadErrors + 1
+end)
+if not okCfg then FZPROF.fail("config", errCfg) end
 end
 
 ----------------------------------------------------------------------
 -- LOAD CHECK
--- The one and only console line. It waits 2 seconds so every background loop
--- has run at least once, then prints only if all panels were created, the
--- game data folder was found, and no error was caught anywhere.
+-- Prints as soon as every part reports ready (checked every 0.05 s, 6 s at most) instead of after a
+-- fixed wait, with the time it took since the script started. If something failed, the caught
+-- error(s) are printed (with the Lua line) so they can be sent to the creator.
 ----------------------------------------------------------------------
 task.spawn(function()
-    wait(2)
-    local allGood = panelOK and invOK and hbOK and slOK and lootOK and bossOK
-        and not labelsBroken
-        and getPlayersFolder() ~= nil
-        and loadErrors == 0
-    if allGood then
-        print("FuzzyHook - PRIVATE has loaded without any errors")
+    local P = FZPROF
+    local deadline = tick() + 6
+    while tick() < deadline do
+        if panelOK and invOK and hbOK and slOK and lootOK and bossOK and getPlayersFolder() ~= nil then break end
+        wait(0.05)
+    end
+    wait(0.1) -- every background loop has finished its first pass
+    local dt = tick() - P.t0
+    P.done = true
+
+    local notReady = {}
+    if not panelOK then notReady[#notReady + 1] = "panels" end
+    if not invOK then notReady[#notReady + 1] = "inventory aim" end
+    if not hbOK then notReady[#notReady + 1] = "hotbar" end
+    if not slOK then notReady[#notReady + 1] = "staff list" end
+    if not lootOK then notReady[#notReady + 1] = "server loot" end
+    if not bossOK then notReady[#notReady + 1] = "boss tracker" end
+    if getPlayersFolder() == nil then notReady[#notReady + 1] = "game data folder (ReplicatedStorage.Players)" end
+    if labelsBroken then notReady[#notReady + 1] = "player labels" end
+
+    if #notReady == 0 and #P.errs == 0 and loadErrors == 0 then
+        local m = math.floor(dt / 60)
+        print(string.format("FuzzyHook - DevBuild has finished loading in %02d:%05.2f seconds.", m, dt - m * 60))
+    else
+        print("FuzzyHook has detected an Error, please restart the script or @ the creator.")
+        if #notReady > 0 then print("  did not load: " .. table.concat(notReady, ", ")) end
+        for i = 1, #P.errs do print("  " .. P.errs[i]) end
+        if #P.errs == 0 and #notReady == 0 then print("  (an error was caught but its text was not recorded)") end
     end
 end)
