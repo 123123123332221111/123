@@ -9,8 +9,6 @@
 --  * No text has a stroke / outline.
 --  * Console: one "finished loading in mm:ss.cc" line as soon as everything is ready, or
 --    the caught error(s) with their Lua line if something failed.
---  * God Mode detection lives inside the Staff List block (it shares that block's
---    scan loop, so it is controlled by the "Staff Alert" toggle).
 --  * Performance Mode (Settings section) turns off the Hotbar fade and the
 --    notification slide animations. The flag lives in Notification.perf.
 
@@ -89,12 +87,12 @@ local function guarded(fn, name)
 end
 
 -- Staff detection: game.Players.<name> has the attributes SpecialChatTag = "Early Access" and/or
--- SpecialChatTagColor = (217, 0, 4). Failsafe: ReplicatedStorage.Players.<name>.Status.GameplayVariables -> Bool "GodMode"
+-- SpecialChatTagColor = (217, 0, 4).
 local STAFF_LABEL = "Early Access"
 
 local TICK_SECONDS = 0.5       -- main loop interval
 local LABEL_OFFSET = Vector3.new(0, 3.2, 0)
-local GOD_COLOR = Color3.fromRGB(255, 165, 20) -- orange: "God Moded" label + God Mode rows in the Staff List
+local GOD_COLOR = Color3.fromRGB(255, 165, 20) -- orange: known-staff label + known-staff rows in the Staff List
 local INFO_RADIUS = 150        -- px from screen center a player must be within to count as "looked at"
 local INFO_SELECT_EVERY = 0.1  -- how often the looked-at player is re-picked (seconds)
 local INFO_REFRESH = 2         -- how often the looked-at player's stats are re-read (seconds)
@@ -462,6 +460,7 @@ DAGR
 Radio
 
 ! Valuable !
+Smartphone
 Gold50g
 GoldSkull
 GoldWatch
@@ -493,6 +492,7 @@ ImmunsterReactor
 WoundDressing
 
 ! Misc !
+Soap
 GiftTier1
 GiftTier2
 GiftTier3
@@ -599,7 +599,7 @@ do
     local slots = {}
     local notes = {}   -- notifications currently on screen
     local DEFAULT_COLOR = Color3.fromRGB(255, 80, 80)
-    local BG_COLOR = Color3.fromRGB(22, 22, 28)
+    local BG_COLOR = Color3.fromRGB(14, 14, 18)
     local TITLE_COLOR = Color3.fromRGB(255, 255, 255)
     local TEXT_COLOR = Color3.fromRGB(190, 190, 200)
     local LINE_COLOR = Color3.fromRGB(80, 80, 92)
@@ -679,6 +679,11 @@ do
                 Size = Vector2.new(W, H), ZIndex = 10, Visible = true,
             }, 0, 0, true)
             pcall(function() bg.Corner = 8 end) -- rounded corners if supported
+            local sk = make(n, "Square", { -- faint outline
+                Filled = false, Thickness = 1, Color = Color3.fromRGB(36, 36, 44),
+                Size = Vector2.new(W, H), ZIndex = 11, Visible = true,
+            }, 0, 0, true)
+            pcall(function() sk.Corner = 8 end)
 
             make(n, "Square", { -- colored dot next to the title
                 Filled = true, Color = accent,
@@ -761,7 +766,7 @@ local REPORT_NOTIFY = { seconds = 10, color = Color3.fromRGB(255, 170, 0) }
 ----------------------------------------------------------------------
 local reportText, reportLabel = "N/A", "Report Count: N/A"
 -- [playerName] = true  -> red "[POSSIBLE MOD]" label (Early Access tag)
--- [playerName] = "god" -> orange "God Moded" label (GodMode on; wins over the tag)
+-- [playerName] = "known" -> orange "DO NOT SHOOT" label (Known Staff list; wins over the tag)
 -- (fed by the Staff List block)
 local modTargets = {}
 
@@ -788,6 +793,7 @@ local IMPORTANT_TOGGLES = {
     { id = "opt_known",     label = "Known Staff Detector", default = true, cb = printToggle("Known Staff Detector") },
     { id = "opt_info",      label = "Player Info",  default = true,  cb = printToggle("Player Info") },
     { id = "opt_teams",     label = "View Player Teams", default = true, cb = printToggle("View Player Teams") },
+    { id = "opt_range",     label = "Enable Distance", default = false, cb = printToggle("Enable Distance") },
     { id = "opt_modtag",    label = "Moderator Tag", default = true, cb = printToggle("Moderator Tag") },
 }
 
@@ -898,6 +904,11 @@ Notification.cfgLoadBtn = function()
     local f = Notification.cfgLoad
     if f then f() end
 end
+-- "Test Webhook" button (the real function is created in the DISCORD WEBHOOK block at the end)
+Notification.hookTestBtn = function()
+    local f = Notification.hookTest
+    if f then f() end
+end
 
 UI.AddTab("FuzzyHook - PRIVATE", function(tab)
     local profT0 = FZPROF.on and tick() -- menu callback timing (runs every frame)
@@ -913,16 +924,18 @@ UI.AddTab("FuzzyHook - PRIVATE", function(tab)
     local world = tab:Section("World Toggles", "Left")
     world:Toggle("opt_dropesp", "Dropped Item ESP", false)
     Notification.kbDrop = world:Keybind("opt_dropesp_kb", 0, "toggle") -- unbound by default: click it in the menu to pick a key
-    world:SliderInt("dropesp_range", "Range (studs)", 1, 1000, 500)
+    world:SliderInt("dropesp_range_m", "Range (meters)", 1, 280, 140)
     world:Spacing()
     world:Toggle("opt_corpseesp", "Corpse ESP", false)
     Notification.kbCorpse = world:Keybind("opt_corpseesp_kb", 0, "toggle")
-    world:SliderInt("corpseesp_range", "Corpse Range (studs)", 1, 1250, 500)
+    world:SliderInt("corpseesp_range_m", "Corpse Range (meters)", 1, 350, 140)
 
     -- Settings: Performance Mode turns off the Hotbar fade and the notification slide
     local settings = tab:Section("Settings", "Left")
     settings:SliderFloat("ui_opacity", "UI Opacity", 0.3, 1.0, DEFAULT_OPACITY, "%.2f")
     settings:SliderInt("dropesp_textsize", "Item ESP Text Size", 8, 30, 14)
+    settings:SliderInt("dropesp_fps", "ESP Label FPS (60 = every frame)", 30, 60, 60)
+    settings:Tip("How often the Item / Corpse ESP labels are redrawn. 60 = every frame (smoothest), 30 = half as often (lighter)")
     settings:Toggle("opt_perf", "Performance Mode", false)
     settings:Toggle("opt_known_alert", "Staff Repository Alert", true)
     settings:Tip("Shows a notification when the known staff list has loaded: how many names and how long it took")
@@ -975,6 +988,7 @@ UI.AddTab("FuzzyHook - PRIVATE", function(tab)
     iface:Combo("hotbar_target", "Hotbar Target", HOTBAR_MODES, 0)
     iface:Button("Reset UI Positions", onResetClick)
     iface:Button("Test Notification", onTestNotifyClick)
+    iface:Button("Test Webhook", Notification.hookTestBtn)
     iface:Button("Hotbar Debug (prints)", onIconTestClick)
     iface:Toggle("opt_prof", "Performance Profiler", false)
     iface:Button("Performance Report (prints)", FZPROF.report)
@@ -1015,18 +1029,6 @@ local function readReports()
     local attr = n:GetAttribute("1")
     if type(attr) == "number" then return attr end
     return n.Value
-end
-
-local function isOn(v)
-    return v == true or v == 1
-end
-
--- A Bool can be stored as an attribute or as a BoolValue child; check both.
-local function readFlag(inst, name)
-    if isOn(inst:GetAttribute(name)) then return true end
-    local child = inst:FindFirstChild(name)
-    if child and isOn(child.Value) then return true end
-    return false
 end
 
 -- Staff check on the PLAYER INSTANCE (game.Players.<name>). Staff carry the attributes
@@ -1143,6 +1145,17 @@ local function addItem(p, class, props, ox, oy, isBg)
     return d
 end
 
+-- Faint outline for a panel box (Filled = false square, same size/corner as the box).
+-- Returns the drawing; the caller keeps it in sync (position follows the panel, size / visibility by hand).
+function Notification.stroke(p, W, H)
+    local d = addItem(p, "Square", {
+        Filled = false, Thickness = 1, Color = Color3.fromRGB(36, 36, 44),
+        Size = Vector2.new(W, H), ZIndex = 1, Visible = false,
+    }, 0, 0, true)
+    pcall(function() d.Corner = 8 end)
+    return d
+end
+
 local function destroyPanel(p)
     for i = 1, #p.items do
         local d = p.items[i].d
@@ -1234,12 +1247,12 @@ task.spawn(function()
 end)
 
 ----------------------------------------------------------------------
--- [POSSIBLE MOD] / "God Moded" labels drawn over detected players
+-- [POSSIBLE MOD] / "DO NOT SHOOT" labels drawn over detected players
 -- (world overlay, not a panel: left opaque and not draggable)
--- modTargets[name] == true  -> red "[POSSIBLE MOD]"
--- modTargets[name] == "god" -> orange "God Moded"
+-- modTargets[name] == true     -> red "[POSSIBLE MOD]"
+-- modTargets[name] == "known"  -> orange "DO NOT SHOOT!!!!!!"
 ----------------------------------------------------------------------
-local modLabels = {}        -- [playerName] = { d = Drawing, plr = Player, part = BasePart, vis = bool, mode = true | "god" }
+local modLabels = {}        -- [playerName] = { d = Drawing, plr = Player, part = BasePart, vis = bool, mode = true | "known" }
 local labelsBroken = false  -- stop retrying if Drawing rejects a property
 
 local function makeModLabel()
@@ -1275,8 +1288,8 @@ RunService.RenderStepped:Connect(function()
         end
     end
 
-    -- "Moderator Tag" toggle (Important Toggles): hides the red [POSSIBLE MOD] labels; "God Moded"
-    -- labels stay. Read at most 4 times a second.
+    -- "Moderator Tag" toggle (Important Toggles): hides the labels above players.
+    -- Read at most 4 times a second.
     local nowT = tick()
     if nowT - (Notification.modTagAt or 0) > 0.25 then
         Notification.modTagAt = nowT
@@ -1314,10 +1327,7 @@ RunService.RenderStepped:Connect(function()
         -- text / color follow the detection type; only written when it changes
         if e.mode ~= mode then
             e.mode = mode
-            if mode == "god" then
-                d.Text = "God Moded"
-                d.Color = GOD_COLOR
-            elseif mode == "known" then
+            if mode == "known" then
                 d.Text = "DO NOT SHOOT!!!!!!" -- player is on the Known Staff list (repo)
                 d.Color = GOD_COLOR
             else
@@ -1326,7 +1336,7 @@ RunService.RenderStepped:Connect(function()
             end
         end
 
-        if part and (mode == "god" or modTagOn) then -- ("known" follows the Moderator Tag toggle too)
+        if part and modTagOn then -- the "Moderator Tag" toggle hides every label above players ("known" too)
             local pos, onScreen = WorldToScreen(part.Position + LABEL_OFFSET)
             if onScreen then
                 d.Position = Vector2.new(pos.X, pos.Y - 7)
@@ -1358,10 +1368,11 @@ local panelOK = pcall(function()
     local GRAY = Color3.fromRGB(190, 190, 200)
 
     local bg = addItem(infoPanel, "Square", {
-        Filled = true, Color = Color3.fromRGB(22, 22, 28),
+        Filled = true, Color = Color3.fromRGB(14, 14, 18),
         Size = Vector2.new(W, H), ZIndex = 1, Visible = false,
     }, 0, 0, true)
     pcall(function() bg.Corner = 8 end) -- rounded corners if supported
+    Notification.stroke(infoPanel, W, H)
 
     addItem(infoPanel, "Square", { -- purple dot next to the title
         Filled = true, Color = Color3.fromRGB(130, 110, 255),
@@ -1535,11 +1546,12 @@ do
         local GRAY = Color3.fromRGB(190, 190, 200)
 
         invBg = addItem(invPanel, "Square", {
-            Filled = true, Color = Color3.fromRGB(22, 22, 28),
+            Filled = true, Color = Color3.fromRGB(14, 14, 18),
             Size = Vector2.new(INV_W, 70), ZIndex = 1, Visible = false,
         }, 0, 0, true)
         pcall(function() invBg.Corner = 8 end)
         invStatic[1] = invBg
+        invStatic[6] = Notification.stroke(invPanel, INV_W, 70)
 
         invStatic[2] = addItem(invPanel, "Square", {
             Filled = true, Color = Color3.fromRGB(130, 110, 255),
@@ -1575,7 +1587,7 @@ do
         invStatic, invLines = {}, {}
     end
 
-    local INV_STATIC_COUNT = 5
+    local INV_STATIC_COUNT = 6
 
     function showInvPanel(visible)
         if visible == invVisible then return end
@@ -1598,6 +1610,7 @@ do
         invLineCount = n
         invPanel.h = 70 + n * INV_ROW_H
         invBg.Size = Vector2.new(INV_W, invPanel.h)
+        if invStatic[6] then invStatic[6].Size = Vector2.new(INV_W, invPanel.h) end
     end
 
     -- An item is shown if it is in the list AND at least one of its categories
@@ -1800,11 +1813,11 @@ do
     --  MAX_HOT above must be at least the number of names in the list.)
     local HOT_SLOTS = { "ItemBack1", "ItemBack2", "Hotbar4", "Hotbar5", "Hotbar6", "Hotbar7", "Hotbar8" }
 
-    local BG_COLOR = Color3.fromRGB(22, 22, 28)
-    local TILE_BG = Color3.fromRGB(30, 34, 48)   -- slightly blue, like the reference
-    local STROKE_COLOR = Color3.fromRGB(64, 72, 96) -- outline around each icon box
-    local EQUIPPED_STROKE = Color3.fromRGB(165, 135, 255) -- brighter purple outline on the item they are holding
-    local EQUIPPED_THICKNESS = 2
+    local BG_COLOR = Color3.fromRGB(14, 14, 18)
+    local TILE_BG = BG_COLOR                    -- same colour as the rest of the UI
+    local STROKE_COLOR = Color3.fromRGB(84, 72, 150) -- outline around each icon box (darker purple than the held item)
+    local EQUIPPED_STROKE = Color3.fromRGB(130, 110, 255) -- brighter purple outline on the item they are holding
+    local EQUIPPED_THICKNESS = 3
     local HL_TILE = Color3.fromRGB(78, 22, 56)   -- tile tint for HIGHLIGHT items
     local WHITE = Color3.fromRGB(255, 255, 255)
     local GRAY = Color3.fromRGB(190, 190, 200)
@@ -1988,10 +2001,20 @@ do
             Size = Vector2.new(100, PILL_H), ZIndex = 1, Visible = false,
         }, 0, 0, true)
         pcall(function() rPill.d.Corner = PILL_H / 2 end)
+        Notification.stroke(hbPanel, 100, PILL_H)
+        rPill.sk = hbPanel.items[#hbPanel.items]
+        pcall(function() rPill.sk.d.Corner = PILL_H / 2 end)
 
         rTitle = make("Text", {
             Text = "", Color = WHITE,
             Font = Drawing.Fonts.SystemBold, Size = 12, Center = true,
+            ZIndex = 2, Visible = false,
+        }, 0, 0)
+
+        -- range line under the name (only drawn while "Player Range" is on); kept on hbPanel (local limit)
+        hbPanel.rg = make("Text", {
+            Text = "", Color = GRAY,
+            Font = Drawing.Fonts.System, Size = 11, Center = true,
             ZIndex = 2, Visible = false,
         }, 0, 0)
 
@@ -2016,6 +2039,8 @@ do
             Size = Vector2.new(100, 24), ZIndex = 1, Visible = false,
         }, 0, 0, true)
         pcall(function() rMsgBg.d.Corner = 8 end)
+        Notification.stroke(hbPanel, 100, 24)
+        rMsgBg.sk = hbPanel.items[#hbPanel.items]
         rMsg = make("Text", {
             Text = "", Color = GRAY,
             Font = Drawing.Fonts.System, Size = 13,
@@ -2034,7 +2059,7 @@ do
             -- outline around the box; registered as a "bg" drawing so the UI Opacity slider affects it
             -- (turns brighter purple while the player is holding this item)
             t.stroke = make("Square", {
-                Filled = false, Thickness = 1, Color = STROKE_COLOR,
+                Filled = false, Thickness = 2, Color = STROKE_COLOR,
                 Size = Vector2.new(TILE, TILE), ZIndex = 2, Visible = false,
             }, 0, 0, true)
             pcall(function() t.stroke.d.Corner = 8 end)
@@ -2076,6 +2101,8 @@ do
             Size = Vector2.new(100, 40), ZIndex = 1, Visible = false,
         }, 0, 0, true)
         pcall(function() rTeamBg.d.Corner = 8 end)
+        Notification.stroke(hbPanel, 100, 40)
+        rTeamBg.sk = hbPanel.items[#hbPanel.items]
         rTeamHead = make("Text", {
             Text = "", Color = WHITE,
             Font = Drawing.Fonts.SystemBold, Size = 12,
@@ -2125,11 +2152,19 @@ do
         if r.vis ~= v then
             r.vis = v
             r.d.Visible = v
+            local k = r.sk
+            if k then k.vis = v; k.d.Visible = v end
         end
     end
 
     local function put(r)
         r.d.Position = Vector2.new(hbPanel.x + r.ox, hbPanel.y + r.oy)
+        local k = r.sk
+        if k then
+            k.ox, k.oy = r.ox, r.oy
+            k.d.Position = r.d.Position
+            k.d.Size = r.d.Size
+        end
     end
 
     local function setRowVisible(list, count, s)
@@ -2163,6 +2198,7 @@ do
         local noGear = s and eqCount == 0
         setVis(rPill, s)
         setVis(rTitle, s)
+        setVis(hbPanel.rg, s and hbPanel.rgOn)
         local st = hbPanel.st
         for k = 1, #st.slots do
             local sl = st.slots[k]
@@ -2256,6 +2292,9 @@ do
         local textW = #titleStr * 6
         -- same padding left and right; the pill grows to fit the stim icons right of the name
         local pillW = textW + 36 + ((sn > 0) and (sn * (st.sz + 3) + 2) or 0)
+        local rgOn = hbPanel.rgOn
+        if rgOn and pillW < 64 then pillW = 64 end -- room for "123.4 m"
+        local pillH = rgOn and (PILL_H + 12) or PILL_H -- Player Range: the pill grows slightly downwards
         local hotW = (hn > 0) and (hn * TILE + (hn - 1) * GAP) or 0
         local tilesW = (n > 0) and (n * TILE + (n - 1) * GAP) or 0
         local msgW = (n == 0) and (#msgStr * 6.5 + PAD * 2) or 0
@@ -2308,7 +2347,7 @@ do
         -- 1) name pill
         local pillX = cx(pillW)
         rPill.ox, rPill.oy = pillX, 0
-        rPill.d.Size = Vector2.new(pillW, PILL_H)
+        rPill.d.Size = Vector2.new(pillW, pillH)
         -- Center = true centers the text on BOTH axes (x and y are its middle point), so y is the pill's middle
         rTitle.ox, rTitle.oy = pillX + 18 + textW / 2 + TITLE_NUDGE_X, PILL_H / 2 - 1
         for k = 1, sn do
@@ -2320,7 +2359,11 @@ do
         end
         -- only the pill grabs the mouse for dragging (see dragStep)
         hbPanel.hx, hbPanel.hw = pillX, pillW
-        local y = PILL_H + PILL_GAP
+        if rgOn then
+            local rg = hbPanel.rg
+            rg.ox, rg.oy = pillX + pillW / 2, PILL_H + 1
+        end
+        local y = pillH + PILL_GAP
 
         -- 2) hotbar items: only shown when at least one slot has something in it
         if hn > 0 then
@@ -2358,6 +2401,7 @@ do
 
         -- positions of the drawings in use
         put(rPill); put(rTitle)
+        if rgOn then put(hbPanel.rg) end
         for k = 1, sn do put(st.slots[k].img); put(st.slots[k].dot) end
         if n == 0 then put(rMsgBg); put(rMsg) end
         putRow(hotTiles, hn)
@@ -2379,7 +2423,7 @@ do
         t.eq = isEq
         t.bg.d.Color = HIGHLIGHT[item] and HL_TILE or TILE_BG
         t.stroke.d.Color = isEq and EQUIPPED_STROKE or STROKE_COLOR
-        t.stroke.d.Thickness = isEq and EQUIPPED_THICKNESS or 1
+        t.stroke.d.Thickness = isEq and EQUIPPED_THICKNESS or 2
         local iconsOn = UI.GetValue("opt_icons_off") ~= true
         if iconsOn and imgState[item] == "ok" then
             t.img.d.Data = imgData[item]
@@ -2803,6 +2847,52 @@ do
     local hotTarget, hotLastRead = nil, 0
     local hotRead = {}
 
+    -- ENABLE DISTANCE (text under the name): meters (1 stud = 0.28 m) from you to the shown player.
+    -- It used to be recalculated only inside the hotbar step (10x/s), which looked laggy while moving; now
+    -- rgFrame (below) runs every frame while it is wanted (hbPanel.rgTarget is set). Cheap: both root parts
+    -- are cached (re-resolved every second or when the target changes), the text is only rewritten when
+    -- the whole-meter value changes, and nothing is allocated per frame.
+    function hbPanel.rgDist(a, b) -- called through pcall: a destroyed part cannot throw out of it
+        return (a.Position - b.Position).Magnitude
+    end
+
+    function hbPanel.rgUpdate(target)
+        local now = tick()
+        if hbPanel.rgFor ~= target or now - (hbPanel.rgAt or 0) >= 1 then
+            hbPanel.rgAt = now
+            hbPanel.rgFor = target
+            local hrp = Notification.hrpCache and Notification.hrpCache[target]
+            if not hrp then
+                local pl = Players:FindFirstChild(target)
+                local ch = pl and pl.Character
+                hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+            end
+            hbPanel.rgHrp = hrp
+            local lc = Players.LocalPlayer.Character
+            hbPanel.rgLh = lc and lc:FindFirstChild("HumanoidRootPart")
+        end
+
+        local di = -1
+        local hrp, lh = hbPanel.rgHrp, hbPanel.rgLh
+        if hrp and lh then
+            local ok, d = pcall(hbPanel.rgDist, hrp, lh)
+            if ok and d then di = math.floor(d * 0.28 + 0.5) end
+        end
+        if hbPanel.rgDi ~= di then
+            hbPanel.rgDi = di
+            hbPanel.rg.d.Text = (di >= 0) and (di .. " m") or "-- m"
+        end
+    end
+
+    function hbPanel.rgFrame()
+        local t = hbPanel.rgTarget
+        if t then hbPanel.rgUpdate(t) end
+    end
+
+    RunService.RenderStepped:Connect(function()
+        guarded(hbPanel.rgFrame, "distance (per frame)")
+    end)
+
     local curTarget, lastRead = nil, 0
     local teamTarget, teamLastRead = nil, 0
     local eqRead, eqSub = {}, {}
@@ -3017,6 +3107,17 @@ do
                 hbPanel.fadeTo(0)
                 dirty = true
             end
+        end
+
+        -- Enable Distance: the text itself is kept live by the per-frame hook (hbPanel.rgUpdate, above);
+        -- this step only decides whether it is wanted and writes the first value right away
+        local rgWant = target ~= nil and target ~= LOCAL_NAME and UI.GetValue("opt_range") == true
+        hbPanel.rgTarget = rgWant and target or nil
+        if rgWant then hbPanel.rgUpdate(target) end
+        if target == nil and hbPanel.fa > 0 then rgWant = hbPanel.rgOn or false end -- keep it while fading out
+        if rgWant ~= (hbPanel.rgOn or false) then
+            hbPanel.rgOn = rgWant
+            dirty = true
         end
 
         if dirty then layout() end
@@ -3237,7 +3338,7 @@ task.spawn(function()
     end
 end)
 
--- (own scope: Staff List panel + God Mode detection; shares slOK)
+-- (own scope: Staff List panel + staff detection; shares slOK)
 local slOK
 do
     ----------------------------------------------------------------------
@@ -3246,17 +3347,11 @@ do
     -- chat tag (game.Players.<name> attributes SpecialChatTag = "Early Access" /
     -- SpecialChatTagColor = 217, 0, 4).
     -- Matcha has no Players.PlayerAdded / PlayerRemoving events (they are nil), so
-    -- game.Players is checked once a second. Only NEW players get their Passes read
-    -- (retried for up to SL_MAX_TRIES seconds in case the Passes folder loads a
-    -- moment after they join); players who left are dropped from the list.
+    -- game.Players is checked once a second. Only NEW players get their tag attributes read
+    -- (retried for up to SL_MAX_TRIES seconds in case they load a moment after they join);
+    -- players who left are dropped from the list.
     -- Other players found with a tag also get a [POSSIBLE MOD] label and a
     -- notification box.
-    -- GOD MODE (second failsafe): ReplicatedStorage.Players.<name>.Status.
-    -- GameplayVariables.GodMode (BoolValue). It is read for every player in the same
-    -- once-a-second scan. While it is on:
-    --   * the player is listed as "<name> - God Mode" (orange) in this panel
-    --   * their label becomes an orange "God Moded" (instead of [POSSIBLE MOD])
-    --   * a red notification box appears when it turns on
     -- The panel is top-anchored (under the Boss Tracker): it grows downward as names are added.
     ----------------------------------------------------------------------
     local STAFF_LIST_INCLUDE_SELF = true -- TEST: lets you see yourself in the list; set to false later
@@ -3268,11 +3363,8 @@ do
     local SL_MAX_TRIES = 6   -- scans (1 per second) to wait for the tag attributes of a new player
 
     local staffSet = {}      -- [name] = true -> has a staff tag
-    local staffChecked = {}  -- [name] = true -> Passes already read for this player
-    local staffPending = {}  -- [name] = tries -> waiting for their Passes to exist
-    local godSet = {}        -- [name] = true -> GodMode is on right now
-    local godSeen = {}       -- [name] = last GodMode state read (true / false), nil = never read
-    local godGV = {}         -- [name] = cached Status.GameplayVariables instance
+    local staffChecked = {}  -- [name] = true -> tag attributes already read for this player
+    local staffPending = {}  -- [name] = tries -> new player still being checked
     local staffDirty = true
     -- Known Staff Detector: accounts from the staff-accounts repo (UserId list; names only for lines
     -- without an id). Kept in one table to save local variables.
@@ -3295,10 +3387,11 @@ do
 
     slOK = pcall(function()
         slBg = addItem(slPanel, "Square", {
-            Filled = true, Color = Color3.fromRGB(22, 22, 28),
+            Filled = true, Color = Color3.fromRGB(14, 14, 18),
             Size = Vector2.new(SL_W, 28), ZIndex = 1, Visible = false,
         }, 0, 0, true)
         pcall(function() slBg.Corner = 8 end)
+        slPanel.sk = Notification.stroke(slPanel, SL_W, 28)
 
         slDot = addItem(slPanel, "Square", {
             Filled = true, Color = Color3.fromRGB(130, 110, 255),
@@ -3347,6 +3440,7 @@ do
     local function layoutStaffPanel(nLines, total, H)
         slPanel.h = H
         slBg.Size = Vector2.new(SL_W, H)
+        if slPanel.sk then slPanel.sk.Size = Vector2.new(SL_W, H) end
 
         if nLines > 0 then
             local text = "Staff Detected (" .. total .. ")"
@@ -3366,16 +3460,13 @@ do
     end
 
     local function renderStaffPanel()
-        -- everyone with a staff tag OR GodMode on (a god-moded player may have no tag)
+        -- everyone with a staff tag, plus the known staff accounts
         local names = {}
         for name in pairs(staffSet) do
             names[#names + 1] = name
         end
-        for name in pairs(godSet) do
-            if not staffSet[name] then names[#names + 1] = name end
-        end
         for name in pairs(K.set) do
-            if not staffSet[name] and not godSet[name] then names[#names + 1] = name end
+            if not staffSet[name] then names[#names + 1] = name end
         end
         table.sort(names)
 
@@ -3384,12 +3475,10 @@ do
         local lines, y = 0, 58
         for i = 1, n do
             local nm = names[i]
-            local god = K.set[nm] == true or godSet[nm] == true -- orange: known staff or God Mode
+            local god = K.set[nm] == true -- orange: known staff
             local text = nm
-            if K.set[nm] == true then
+            if god then
                 text = nm .. ", known mod account!"
-            elseif godSet[nm] == true then
-                text = nm .. " - God Mode"
             end
             if total > SL_MAX_ROWS and i == SL_MAX_ROWS then
                 text = "+" .. (total - SL_MAX_ROWS + 1) .. " more"
@@ -3441,6 +3530,7 @@ do
         slVisible = v
         slPanel.shown = v
         slBg.Visible = v
+        if slPanel.sk then slPanel.sk.Visible = v end
         slDot.Visible = v
         slTitle.Visible = v
         if not v then
@@ -3453,55 +3543,16 @@ do
         end
     end
 
-    -- Decides which label a player gets: GodMode wins over the Early Access tag.
+    -- Decides which label a player gets: a known staff account wins over the Early Access tag.
     -- (You never get a label over yourself.)
     local function refreshLabel(name)
         if name == LOCAL_NAME then return end
         if K.set[name] then
             modTargets[name] = "known"
-        elseif godSet[name] then
-            modTargets[name] = "god"
         elseif staffSet[name] then
             modTargets[name] = true
         else
             modTargets[name] = nil
-        end
-    end
-
-    -- Reads GodMode for one player (called once a second from syncStaff).
-    -- ReplicatedStorage.Players.<name>.Status.GameplayVariables is cached per player
-    -- and only looked up again when it is missing / was replaced.
-    local function checkGod(name)
-        local gv = godGV[name]
-        if not gv or gv.Parent == nil then
-            local folder = getPlayersFolder()
-            local n = folder and folder:FindFirstChild(name)
-            n = n and n:FindFirstChild("Status")
-            gv = n and n:FindFirstChild("GameplayVariables")
-            godGV[name] = gv -- nil = not loaded yet, tried again next scan
-        end
-
-        local on = (gv ~= nil) and readFlag(gv, "GodMode")
-        local was = godSeen[name]
-        godSeen[name] = on
-        local isMe = (name == LOCAL_NAME)
-
-        if on then
-            if not isMe or STAFF_LIST_INCLUDE_SELF then
-                if not godSet[name] then
-                    godSet[name] = true
-                    staffDirty = true
-                    refreshLabel(name)
-                end
-            end
-            -- red box when GodMode turns on (or when it is already on the first time we see the player)
-            if not isMe and was ~= true then
-                Notification.push("God Mode Detector", name .. " is God Moded", STAFF_NOTIFY)
-            end
-        elseif godSet[name] then
-            godSet[name] = nil
-            staffDirty = true
-            refreshLabel(name)
         end
     end
 
@@ -3528,7 +3579,7 @@ do
                     staffSet[name] = true
                     staffDirty = true
                     if not isMe then
-                        refreshLabel(name) -- [POSSIBLE MOD] label (or "God Moded" if GodMode is on)
+                        refreshLabel(name) -- [POSSIBLE MOD] label
                         if not K.set[name] then -- (a known staff member already got its own notification)
                             Notification.push("Staff Detector", name .. " has " .. STAFF_LABEL, STAFF_NOTIFY)
                         end
@@ -3548,15 +3599,8 @@ do
         end
     end
 
-    -- Scans game.Players: queues players we have not checked yet, reads GodMode for
-    -- everyone, drops ones that are gone
+    -- Scans game.Players: queues players we have not checked yet and drops ones that are gone
     local function syncStaff()
-        -- PERFORMANCE: the GodMode flag of EVERY player was read each second (about 130 ms). It is now
-        -- read every 3rd scan; a player we have never read is still checked immediately. A GodMode
-        -- change can take up to 3 seconds to show. (counter kept on slPanel: no extra local variable)
-        slPanel.gtick = ((slPanel.gtick or 0) + 1) % 3
-        local godNow = (slPanel.gtick == 0)
-
         local present = {}
         for _, plr in ipairs(Players:GetPlayers()) do
             local name = plr.Name
@@ -3564,9 +3608,6 @@ do
             if K.tagOn then
                 if not staffChecked[name] and staffPending[name] == nil then
                     staffPending[name] = 0
-                end
-                if godNow or godSeen[name] == nil then
-                    checkGod(name)
                 end
             end
             -- Known Staff Detector: each player is compared with the repo list once per list version
@@ -3615,17 +3656,6 @@ do
         for name in pairs(staffPending) do
             if not present[name] then staffPending[name] = nil end
         end
-        for name in pairs(godSeen) do
-            if not present[name] then
-                godSeen[name] = nil
-                godGV[name] = nil
-                if godSet[name] then
-                    godSet[name] = nil
-                    staffDirty = true
-                end
-                modTargets[name] = nil
-            end
-        end
 
         if K.tagOn then processStaffPending() end
     end
@@ -3643,7 +3673,6 @@ do
             if K.sig ~= sig then
                 K.sig = sig
                 staffSet, staffChecked, staffPending, modTargets = {}, {}, {}, {}
-                godSet, godSeen, godGV = {}, {}, {}
                 K.set, K.checked = {}, {}
                 staffDirty = true
             end
@@ -3658,7 +3687,6 @@ do
             if staffWasOn then
                 -- turned off: reset everything so a fresh scan runs when it is turned back on
                 staffSet, staffChecked, staffPending, modTargets = {}, {}, {}, {}
-                godSet, godSeen, godGV = {}, {}, {}
                 K.set, K.checked, K.sig = {}, {}, nil
             end
             setStaffPanelVisible(false)
@@ -3786,11 +3814,13 @@ do
 
     lootOK = pcall(function()
         lootBg = addItem(lootPanel, "Square", {
-            Filled = true, Color = Color3.fromRGB(22, 22, 28),
+            Filled = true, Color = Color3.fromRGB(14, 14, 18),
             Size = Vector2.new(LOOT_W, 36), ZIndex = 1, Visible = false,
         }, 0, 0, true)
         pcall(function() lootBg.Corner = 8 end)
         lootStatic[1] = lootBg
+        lootPanel.sk = Notification.stroke(lootPanel, LOOT_W, 36)
+        lootStatic[4] = lootPanel.sk
 
         lootStatic[2] = addItem(lootPanel, "Square", {
             Filled = true, Color = Color3.fromRGB(130, 110, 255),
@@ -3933,6 +3963,7 @@ do
             lootRowCount = n
             lootPanel.h = LOOT_ROW_Y + n * LOOT_ROW_H + 8
             lootBg.Size = Vector2.new(LOOT_W, lootPanel.h)
+            if lootPanel.sk then lootPanel.sk.Size = Vector2.new(LOOT_W, lootPanel.h) end
         end
 
         local title = "Server Loot (" .. #results .. ")"
@@ -4036,10 +4067,11 @@ do
 
     bossOK = pcall(function()
         local bg = addItem(bossPanel, "Square", {
-            Filled = true, Color = Color3.fromRGB(22, 22, 28),
+            Filled = true, Color = Color3.fromRGB(14, 14, 18),
             Size = Vector2.new(BOSS_W, BOSS_H), ZIndex = 1, Visible = false,
         }, 0, 0, true)
         pcall(function() bg.Corner = 8 end)
+        Notification.stroke(bossPanel, BOSS_W, BOSS_H)
 
         addItem(bossPanel, "Square", { -- purple dot next to the title
             Filled = true, Color = Color3.fromRGB(130, 110, 255),
@@ -4308,6 +4340,8 @@ do
     local ESP_OUTLINE = Color3.fromRGB(0, 0, 0)
     local ESP_FONT = Drawing.Fonts.ProximaSoftBold  -- try Drawing.Fonts.SystemBold / Monospace / Pixel / Minecraft
     local ESP_FONT_SIZE = 14
+    local M_PER_STUD = 0.28          -- game distances: 1 stud = 0.28 m (the sliders and labels are in meters)
+    local STUDS_PER_M = 1 / M_PER_STUD
 
     -- Every item keeps ITS OWN label (Text drawing) for as long as it stays in the results, so labels
     -- never swap between items when the list is re-sorted (that swapping was the flicker).
@@ -4378,7 +4412,7 @@ do
             Mag556Rnd100 Mag556Round100 ThermalModule 338AP ]] },
         { cat = "Valuable",       on = "wtc_valuable", col = "wtc_valuable_col", def = { 1.0, 0.84, 0.0 }, items = [[
             GPU Gold50g WhisperPlush InflatedCrown WeddingRing MikeShades EnzoPlush DozerPlush DozerArmor
-            AntonPlush GoldenMakarov GoldSkull GoldWatch PortableConsole Rubles SolterStatue SPSh44 JPC ]] },
+            AntonPlush GoldenMakarov GoldSkull GoldWatch PortableConsole Rubles SolterStatue SPSh44 JPC Smartphone ]] },
         { cat = "Weapons",        on = "wtc_weapons",  col = "wtc_weapons_col", def = { 1.0, 0.39, 0.39 }, items = [[
             ADAR15 AKM AKMN AsVal FAL Groza IZh12 IZh81 M4 MK23 Makarov Mosin MP443 MP5SD NagantRevolver
             PKM PPSH41 R700 RPG7 SKS SVD Saiga12 TFZ0 TFZ98S TOZ106 TT33 VZ61
@@ -4523,7 +4557,7 @@ do
     -- last = numbers from the latest scan (for the debug button), bad = consecutive errors per task
     local CP = { no = {}, low = {}, junk = {}, pos = {}, nh = {}, scan = 0, recheck = 120, every = ESP_SCAN_EVERY, heavy = false,
         trips = 0, bad = {}, last = { cpu = 0, n = 0, items = 0, corpses = 0, wall = 0 },
-        act = { item = false, corpse = false, size = nil, at = 0 } }
+        act = { item = false, corpse = false, size = nil, fps = 60, at = 0 }, nextDraw = 0 }
     -- true when the object has a Humanoid child (matched by class or by name; GetChildren is used
     -- because it is known to work in Matcha)
     CP.hasHum = function(obj)
@@ -4676,6 +4710,7 @@ do
         A.item = espActive()
         A.corpse = corpseActive()
         A.size = UI.GetValue("dropesp_textsize")
+        A.fps = UI.GetValue("dropesp_fps")
         return A
     end
 
@@ -4700,7 +4735,7 @@ do
         local char = Players.LocalPlayer.Character
         local hrp = char and char:FindFirstChild("HumanoidRootPart")
         originPart = valid(hrp) and hrp or nil
-        local range = UI.GetValue("dropesp_range") or 500
+        local range = (UI.GetValue("dropesp_range_m") or 140) * STUDS_PER_M -- sliders are meters, distances in the scan are studs
 
         -- items and corpses are found in the SAME walk of the folder
         local A = refreshActive(true)
@@ -4712,7 +4747,7 @@ do
         local state = { n = 0, items = itemOn, scan = CP.scan, cpu = 0, t = t0 }
         if corpseOn then
             state.corpses = {}
-            state.crange = UI.GetValue("corpseesp_range") or 500
+            state.crange = (UI.GetValue("corpseesp_range_m") or 140) * STUDS_PER_M
         end
         collect(root, 1, found, origin, range, state)
         state.cpu = state.cpu + (tick() - state.t)
@@ -4808,6 +4843,17 @@ do
         local n = entryCount
         if n == 0 then return end
 
+        -- "ESP Label FPS" slider (30-60): below 60 the labels are redrawn only that many times a second
+        -- (a steady cadence, not "skip a random frame"); 60 = every frame
+        local fps = A.fps
+        if type(fps) == "number" and fps < 60 then
+            local now = tick()
+            if now < CP.nextDraw then return end
+            local step = 1 / (fps < 30 and 30 or fps)
+            CP.nextDraw = CP.nextDraw + step
+            if CP.nextDraw < now then CP.nextDraw = now + step end
+        end
+
         local opos = lastOrigin
         local op = originPart
         if op then
@@ -4832,10 +4878,10 @@ do
                     e.off = 0
 
                     local dist = opos and (pp - opos).Magnitude or e.dist
-                    local di = math.floor(dist)
+                    local di = math.floor(dist * M_PER_STUD + 0.5) -- meters
                     if e.di ~= di then
                         e.di = di
-                        e.txt = e.name .. " [" .. di .. "]"
+                        e.txt = e.name .. " [" .. di .. "m]"
                     end
                     if e.shownTxt ~= e.txt then
                         e.shownTxt = e.txt
@@ -4849,8 +4895,12 @@ do
                         d.Color = e.col or (HIGHLIGHT[e.name] == true and HIGHLIGHT_COLOR or ESP_COLOR)
                     end
 
-                    local px, py = math.floor(pos.X + 0.5), math.floor(pos.Y - 6.5)
-                    if e.px ~= px or e.py ~= py then -- only written when the pixel position changed
+                    -- exact (not rounded) screen position: rounding to whole pixels made the text jump 1 px
+                    -- at a time ("teleporty") while the camera moved slowly; it is only written when it
+                    -- moved by 0.05 px or more
+                    local px, py = pos.X, pos.Y - 6.5
+                    local ox, oy = e.px, e.py
+                    if ox == nil or math.abs(ox - px) >= 0.05 or math.abs(oy - py) >= 0.05 then
                         e.px, e.py = px, py
                         d.Position = Vector2.new(px, py)
                     end
@@ -4884,7 +4934,7 @@ do
                     return ok and r or ("error: " .. tostring(r))
                 end)()
                 .. " | ESP active = " .. tostring(espActive())
-                .. " | range = " .. tostring(UI.GetValue("dropesp_range")))
+                .. " | range = " .. tostring(UI.GetValue("dropesp_range_m")) .. " m (" .. math.floor((UI.GetValue("dropesp_range_m") or 0) * STUDS_PER_M) .. " studs) | label FPS = " .. tostring(UI.GetValue("dropesp_fps")))
 
             local root, rootName = nil, "none"
             local names = { "DroppedItems", "RuntimeItems", "Drops" }
@@ -4916,7 +4966,7 @@ do
                 print("[Drop debug] could not read your position (character and camera both nil)")
                 return
             end
-            local range = UI.GetValue("dropesp_range") or 500
+            local range = (UI.GetValue("dropesp_range_m") or 140) * STUDS_PER_M
             readEspFilters()
             local st = { n = 0, folders = 0, matched = 0, inrange = 0, other = 0, samples = {}, skipped = {},
                 models = 0, corpses = 0, csamples = {} }
@@ -4980,7 +5030,7 @@ do
                 for i = 1, #st.skipped do print("[Drop debug]   skipped: " .. st.skipped[i]) end
             end
             print("[Drop debug] corpse check: Models inspected = " .. st.models .. " | with a Humanoid (corpses) = " .. st.corpses
-                .. " | Corpse ESP active = " .. tostring(corpseActive()) .. " | corpse range = " .. tostring(UI.GetValue("corpseesp_range")))
+                .. " | Corpse ESP active = " .. tostring(corpseActive()) .. " | corpse range = " .. tostring(UI.GetValue("corpseesp_range_m")) .. " m")
             for i = 1, #st.csamples do print("[Drop debug] corpse: " .. st.csamples[i]) end
             if st.corpses == 0 and st.models > 0 then
                 print("[Drop debug] no Model had a Humanoid child; if corpses look different (e.g. no Humanoid), send me the corpse's children")
@@ -5002,7 +5052,7 @@ do
             if entryCount > 0 then
                 local e = entries[1]
                 local pos, on = WorldToScreen(e.part.Position)
-                print("[Drop debug] nearest entry: " .. e.name .. " dist=" .. math.floor(e.dist)
+                print("[Drop debug] nearest entry: " .. e.name .. " dist=" .. math.floor(e.dist * M_PER_STUD) .. " m (" .. math.floor(e.dist) .. " studs)"
                     .. " screen=(" .. math.floor(pos.X) .. ", " .. math.floor(pos.Y) .. ") onScreen=" .. tostring(on))
             end
             print("[Drop debug] done")
@@ -5138,7 +5188,7 @@ do local okCfg, errCfg = pcall(function()
         IDS[#IDS + 1] = CATEGORY_TOGGLES[i].id
         IDS[#IDS + 1] = CATEGORY_TOGGLES[i].espId
     end
-    for id in string.gmatch([[opt_dropesp dropesp_range opt_corpseesp corpseesp_range ui_opacity dropesp_textsize
+    for id in string.gmatch([[opt_dropesp dropesp_range_m opt_corpseesp corpseesp_range_m ui_opacity dropesp_textsize dropesp_fps
         opt_perf opt_icons_off hotbar_target wtc_armor wtc_weapons wtc_super wtc_valuable wtc_meds wtc_stims
         wtc_corpse]], "%S+") do
         IDS[#IDS + 1] = id
@@ -5151,7 +5201,7 @@ do local okCfg, errCfg = pcall(function()
 
     -- Allowed range of the sliders. A value outside it (like the 0 that ended up in the saved file when a
     -- slider had not been created yet) is neither saved nor applied: the slider keeps its default.
-    local RANGES = { dropesp_range = { 1, 1000 }, corpseesp_range = { 1, 1250 }, dropesp_textsize = { 8, 30 },
+    local RANGES = { dropesp_range_m = { 1, 280 }, corpseesp_range_m = { 1, 350 }, dropesp_textsize = { 8, 30 }, dropesp_fps = { 30, 60 },
         ui_opacity = { 0.3, 1 } }
     local function validValue(id, x)
         local r = RANGES[id]
@@ -5352,6 +5402,26 @@ do local okCfg, errCfg = pcall(function()
         if type(cfg.k) ~= "table" then cfg.k = {} end
         if type(cfg.p) ~= "table" then cfg.p = {} end
 
+        -- an older save has the ranges in studs: converted to meters (x 0.28); ids that no longer exist are dropped
+        do
+            local legacy = { dropesp_range = "dropesp_range_m", corpseesp_range = "corpseesp_range_m" }
+            local known = {}
+            for i = 1, #IDS do known[IDS[i]] = true end
+            local drop, add = {}, {}
+            for id, v in pairs(cfg.v) do
+                if not known[id] then
+                    drop[#drop + 1] = id
+                    local nid = legacy[id]
+                    if nid and type(v) == "number" and cfg.v[nid] == nil then add[nid] = math.floor(v * 0.28 + 0.5) end
+                end
+            end
+            for i = 1, #drop do cfg.v[drop[i]] = nil end -- (changed after the loop, never during it)
+            for nid, m in pairs(add) do
+                cfg.v[nid] = m
+                print("[Config] converted an old range in studs to " .. nid .. " = " .. m .. " m")
+            end
+        end
+
         -- repair an older save: values outside their slider's range (e.g. the 0s) are dropped
         for id in pairs(cfg.v) do
             if not validValue(id, cfg.v[id]) then
@@ -5416,6 +5486,180 @@ do local okCfg, errCfg = pcall(function()
     end)
 end)
 if not okCfg then FZPROF.fail("config", errCfg) end
+end
+
+----------------------------------------------------------------------
+-- DISCORD WEBHOOK
+-- Notification.hookStaff(name, userId) sends the staff alert embed ("Unlisted Possible Staff Detected",
+-- Roblox headshot + profile link, server info read from game.ReplicatedStorage.ServerStatus: ServerId,
+-- ServerLocation, Premium, Veteran). "Test Webhook" (Debug Options) sends a plain test message with no account info.
+-- The staff detectors are NOT wired to it yet; when they are, they just call Notification.hookStaff(...).
+-- Messages go out from ONE background thread, at most one every 2 seconds (Discord rate limits), so a
+-- send never stalls a frame. The webhook URL is in this file: anyone who has the file can post to it.
+-- (wrapped in a function so its locals do not count against the main chunk's 200-local limit)
+----------------------------------------------------------------------
+do
+local okHook, errHook = pcall(function()
+    local URL = "https://discord.com/api/webhooks/1570209919301451878/j-VHJnCli4Y1fCRajjEwx_RahZtG8Oz85RETFBagMLUNW_LaQsE5b15rysujXRqS5EyL"
+    local RED = 14221316 -- Color3 (217, 0, 4) as a Discord embed colour
+    local Http = game:GetService("HttpService")
+    local NOTE = { seconds = 5, color = Color3.fromRGB(88, 101, 242) }
+    local queue, running = {}, false
+
+    -- Roblox headshot image URL for a user id. Discord did not show the thumbnail when given Roblox's
+    -- redirect URL, so the real image URL is looked up through Roblox's thumbnails API (one request per
+    -- user, cached). Runs inside the sender thread. Falls back to the redirect URL if the lookup fails.
+    local thumbCache = {}
+    local function thumbUrl(uid)
+        local hit = thumbCache[uid]
+        if hit then return hit end
+        local url = "https://www.roblox.com/headshot-thumbnail/image?userId=" .. uid .. "&width=150&height=150&format=png"
+        if httpget then
+            local ok, res = pcall(httpget,
+                "https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=" .. uid .. "&size=150x150&format=Png&isCircular=false")
+            if ok and type(res) == "string" then
+                local okD, data = pcall(function() return Http:JSONDecode(res) end)
+                local row = okD and type(data) == "table" and type(data.data) == "table" and data.data[1]
+                local img = type(row) == "table" and row.imageUrl
+                if type(img) == "string" and img ~= "" then
+                    url = img
+                    thumbCache[uid] = url -- only a successful lookup is cached
+                end
+            end
+        end
+        return url
+    end
+
+    local function worker()
+        wait(0.05) -- yields first, so a button click returns immediately
+        while #queue > 0 do
+            local item = table.remove(queue, 1)
+            if item.uid then item.embed.thumbnail = { url = thumbUrl(item.uid) } end -- headshot, top right
+            local okB, body = pcall(function()
+                return Http:JSONEncode({ username = "FuzzyHook", embeds = { item.embed } })
+            end)
+            local ok, res = false, "could not build the message"
+            if okB then ok, res = pcall(httppost, URL, body, "application/json") end
+            local err
+            if not ok then
+                err = tostring(res)
+            elseif type(res) == "string" and string.find(res, '"message"', 1, true) then
+                err = res -- Discord answers errors (bad URL, rate limit...) with {"message": ...}
+            end
+            if item.test then
+                if err then
+                    print("[Webhook] failed: " .. err)
+                    Notification.push("Webhook", "Failed: " .. string.sub(err, 1, 30), NOTE)
+                else
+                    Notification.push("Webhook", "Test sent - check Discord", NOTE)
+                end
+            end
+            wait(2)
+        end
+        running = false
+    end
+
+    -- embed = a Discord embed table (title, url, description, color, thumbnail, fields, footer ...);
+    -- uid (optional) = Roblox user id whose headshot becomes the thumbnail (looked up when it is sent);
+    -- returns false if it could not be queued
+    function Notification.webhook(embed, isTest, uid)
+        if not httppost then
+            if isTest then Notification.push("Webhook", "httppost is not available", NOTE) end
+            return false
+        end
+        embed.color = embed.color or RED
+        queue[#queue + 1] = { embed = embed, uid = uid, test = isTest == true }
+        if not running then
+            running = true
+            task.spawn(worker)
+        end
+        return true
+    end
+
+    local function flag(v)
+        if type(v) == "string" then
+            local l = string.lower(v)
+            if l == "true" or l == "1" then v = true elseif l == "false" or l == "0" then v = false end
+        end
+        if v == true or v == 1 then return "\u{2705}" end   -- green check
+        if v == false or v == 0 then return "\u{274C}" end  -- red cross
+        return "\u{2754}"                                    -- white question mark (unknown)
+    end
+    local FLAG_UNKNOWN = "\u{2754}" -- what flag() returns when it cannot read the value
+
+    -- Server info from game.ReplicatedStorage.ServerStatus (attributes)
+    local function serverFields()
+        local ss = ReplicatedStorage:FindFirstChild("ServerStatus")
+        local id, loc, prem, vet
+        -- a value can be an attribute on ServerStatus, or a Value object (BoolValue / StringValue) inside it
+        local function srv(key)
+            local v = ss:GetAttribute(key)
+            if v == nil then
+                local c = ss:FindFirstChild(key)
+                if c then
+                    local okv, val = pcall(function() return c.Value end)
+                    if okv then v = val end
+                end
+            end
+            return v
+        end
+        if ss then
+            id, loc = srv("ServerId"), srv("ServerLocation")
+            prem, vet = srv("Premium"), srv("Veteran")
+        end
+        local premText, vetText = flag(prem), flag(vet)
+        local fields = {
+            { name = "\u{1F5A5}\u{FE0F} Server ID", value = (type(id) == "string" and id ~= "") and id or "Unknown", inline = true },
+            { name = "\u{1F30D} Server Location", value = (type(loc) == "string" and loc ~= "") and loc or "Unknown", inline = true },
+            { name = "\u{200B}", value = "\u{200B}", inline = true }, -- empty third column: keeps two fields per row
+            { name = "\u{1F48E} Premium Server", value = premText, inline = true }, -- (Server ID + Location on the first row, Premium + Veteran on the second)
+            { name = "\u{1F396}\u{FE0F} Veteran Server", value = vetText, inline = true },
+            { name = "\u{200B}", value = "\u{200B}", inline = true }, -- empty third column
+        }
+        -- "Main Menu": only added when BOTH Premium and Veteran could not be read (Unknown). Own row,
+        -- same two-column look as the rows above.
+        if premText == FLAG_UNKNOWN and vetText == FLAG_UNKNOWN then
+            fields[#fields + 1] = { name = "\u{1F3E0} Main Menu", value = "\u{2705}", inline = true }
+            fields[#fields + 1] = { name = "\u{200B}", value = "\u{200B}", inline = true }
+            fields[#fields + 1] = { name = "\u{200B}", value = "\u{200B}", inline = true }
+        end
+        return fields
+    end
+
+    -- Staff alert embed: title links to the staff member's Roblox profile, their headshot is the thumbnail
+    -- (top right), the description has "name (ID)" as a direct profile link, then the server info.
+    -- note = optional italic line above the link. No image at the bottom.
+    function Notification.hookStaff(name, userId, note, isTest)
+        local profile = "https://www.roblox.com/users/" .. userId .. "/profile"
+        local safe = (string.gsub(name, "[_*~`|]", "\\%0")) -- keep usernames from turning into markdown
+        local desc = "\u{1F464} [" .. safe .. "](" .. profile .. ")  \u{2022}  ID: `" .. userId .. "`"
+        if note then desc = note .. "\n" .. desc end
+        return Notification.webhook({
+            title = "Unlisted Possible Staff Detected",
+            url = profile,
+            description = desc,
+            color = RED,
+            fields = serverFields(),
+            footer = { text = "FuzzyHook" },
+        }, isTest, userId) -- userId: the sender thread adds the headshot thumbnail
+    end
+
+    -- "Test Webhook" button: sends a plain test message with NO account details
+    -- (no username, no user id, no headshot), so pressing it never reveals who runs the script.
+    Notification.hookTest = function()
+        local ok = pcall(function()
+            Notification.webhook({
+                title = "Webhook test",
+                description = "This is a test message. It contains no account information.",
+                color = 5793266,
+                fields = serverFields(), -- Server ID, Location, Premium, Veteran (server info only)
+                footer = { text = "FuzzyHook" },
+            }, true) -- true = test; no user id is passed, so no headshot is attached
+        end)
+        if not ok then Notification.push("Webhook", "Test failed to build", NOTE) end
+    end
+end)
+if not okHook then FZPROF.fail("webhook", errHook) end
 end
 
 ----------------------------------------------------------------------
