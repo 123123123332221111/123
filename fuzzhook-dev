@@ -982,6 +982,10 @@ UI.AddTab("FuzzyHook - PRIVATE", function(tab)
     iface:Button("Staff Debug (prints)", Notification.staffDebug)
     iface:Toggle("inv_showall", "Inv Aim: Show All (debug)", false)
     iface:Text("Drag a panel by its top bar")
+    -- every widget above has been declared now: the config loader may apply saved values / keybinds
+    Notification.uiBuilt = true
+    local cfgTick = Notification.cfgTick
+    if cfgTick then cfgTick() end
     if profT0 then FZPROF.add("menu tab callback (per frame)", tick() - profT0) end
 end)
 
@@ -5145,6 +5149,16 @@ do local okCfg, errCfg = pcall(function()
     end
     local KEYS = { opt_dropesp_kb = "kbDrop", opt_corpseesp_kb = "kbCorpse" } -- keybind id -> field on Notification
 
+    -- Allowed range of the sliders. A value outside it (like the 0 that ended up in the saved file when a
+    -- slider had not been created yet) is neither saved nor applied: the slider keeps its default.
+    local RANGES = { dropesp_range = { 1, 1000 }, corpseesp_range = { 1, 1250 }, dropesp_textsize = { 8, 30 },
+        ui_opacity = { 0.3, 1 } }
+    local function validValue(id, x)
+        local r = RANGES[id]
+        if r and (type(x) ~= "number" or x < r[1] - 0.001 or x > r[2] + 0.001) then return false end
+        return true
+    end
+
     local function same(a, b)
         if type(a) == "number" and type(b) == "number" then return math.abs(a - b) < 0.001 end
         return a == b
@@ -5193,7 +5207,13 @@ do local okCfg, errCfg = pcall(function()
         local cfg = { ver = 1, v = {}, c = {}, k = {}, p = {} }
         for i = 1, #IDS do
             local x = UI.GetValue(IDS[i])
-            if type(x) == "boolean" or type(x) == "number" then cfg.v[IDS[i]] = x end
+            if type(x) == "boolean" or type(x) == "number" then
+                if validValue(IDS[i], x) then
+                    cfg.v[IDS[i]] = x
+                else
+                    print("[Config] not saved: " .. IDS[i] .. " has an invalid value (" .. tostring(x) .. "), probably its widget does not exist yet")
+                end
+            end
         end
         for i = 1, #COLORS do
             local c = readColor(COLORS[i])
@@ -5238,31 +5258,68 @@ do local okCfg, errCfg = pcall(function()
 
     -- One pass: sets whatever differs from the saved value and returns how many values have not
     -- stuck yet (e.g. a widget the menu has not created yet).
-    local function pass(cfg)
+    -- `done` remembers what has already been applied, so a later pass never overwrites something you
+    -- changed yourself in the meantime.
+    local function pass(cfg, done, log)
+        -- nothing is applied before the menu callback has declared its widgets once: a value set on a
+        -- slider / keybind that does not exist yet can be lost or end up as 0 (the callback runs
+        -- right after the script starts, so this normally waits less than a second)
+        if not Notification.uiBuilt then return 1000 end
         local left = 0
         for id, v in pairs(cfg.v) do
-            if not same(UI.GetValue(id), v) then
-                pcall(UI.SetValue, id, v)
-                if not same(UI.GetValue(id), v) then left = left + 1 end
+            if not done[id] then
+                if not same(UI.GetValue(id), v) then
+                    pcall(UI.SetValue, id, v)
+                    if log then log[#log + 1] = id end
+                end
+                if same(UI.GetValue(id), v) then done[id] = true else left = left + 1 end
             end
         end
         for id, c in pairs(cfg.c) do
-            if type(c) == "table" and not setColor(id, c) then left = left + 1 end
+            if not done[id] and type(c) == "table" then
+                if setColor(id, c) then done[id] = true else left = left + 1 end
+            end
         end
         for id, kv in pairs(cfg.k) do
-            local kb = Notification[KEYS[id] or ""]
-            if not kb then
-                left = left + 1
-            elseif type(kv) == "table" then
-                pcall(function()
-                    local want = kv[1]
-                    if type(want) == "string" then want = Enum.KeyCode[want] end -- saved by name (Enum key)
-                    if want ~= nil and kb:GetKey() ~= want then kb:SetKey(want) end
-                    if kv[2] and kb:GetType() ~= kv[2] then kb:SetType(kv[2]) end
-                end)
+            if not done[id] then
+                local kb = Notification[KEYS[id] or ""]
+                if not kb then
+                    left = left + 1 -- the keybind widget has not been created yet
+                elseif type(kv) == "table" then
+                    local okK, stuck = pcall(function()
+                        local want = kv[1]
+                        if type(want) == "string" then want = Enum.KeyCode[want] end -- saved by name (Enum key)
+                        if want ~= nil and kb:GetKey() ~= want then
+                            kb:SetKey(want)
+                            if log then log[#log + 1] = id end
+                        end
+                        if kv[2] and kb:GetType() ~= kv[2] then kb:SetType(kv[2]) end
+                        return want == nil or kb:GetKey() == want
+                    end)
+                    if okK and stuck then done[id] = true else left = left + 1 end
+                else
+                    done[id] = true
+                end
             end
         end
         return left
+    end
+
+    local CFGSTATE -- the load in progress / being verified
+    -- called by the menu callback after it declared its widgets: apply right then instead of waiting for the timer
+    Notification.cfgTick = function()
+        local S = CFGSTATE
+        if S and not S.finished then
+            local now = tick()
+            if now - S.last >= 0.25 then
+                S.last = now
+                if pass(S.cfg, S.done) == 0 then
+                    S.finished = true
+                    S.verifyUntil = now + 8
+                    print("[Config] every saved setting and keybind has been applied")
+                end
+            end
+        end
     end
 
     local function save()
@@ -5295,16 +5352,53 @@ do local okCfg, errCfg = pcall(function()
         if type(cfg.k) ~= "table" then cfg.k = {} end
         if type(cfg.p) ~= "table" then cfg.p = {} end
 
-        pcall(applyPanels, cfg)
-        local work = tick() - t0
-        for _ = 1, 6 do -- retries only matter while the menu is still being built
-            local t = tick()
-            local left = pass(cfg)
-            work = work + (tick() - t)
-            if left == 0 then break end
-            wait(0.5)
+        -- repair an older save: values outside their slider's range (e.g. the 0s) are dropped
+        for id in pairs(cfg.v) do
+            if not validValue(id, cfg.v[id]) then
+                print("[Config] ignored invalid saved value for " .. id .. " (" .. tostring(cfg.v[id]) .. ")")
+                cfg.v[id] = nil
+            end
         end
+
+        pcall(applyPanels, cfg)
+        local done = {}
+        local t = tick()
+        local left = pass(cfg, done)
+        local work = (t - t0) + (tick() - t)
         print(string.format("Saved Config loaded in %.2f seconds!", work))
+
+        -- Settings are applied only once their widgets exist (see pass). Applying is attempted right when
+        -- the menu callback has declared them (cfgTick) and every 0.5 s for the first 10 s, then every 2 s.
+        -- After everything stuck, the values are CHECKED again for 8 seconds: a slider or keybind that
+        -- the menu resets after the load (back to its default / 0) is re-applied, and the console says so.
+        local S = { cfg = cfg, done = done, finished = (left == 0), last = 0 }
+        CFGSTATE = S
+        if S.finished then S.verifyUntil = tick() + 8 end
+        task.spawn(function()
+            local tries = 0
+            while CFGSTATE == S do
+                tries = tries + 1
+                wait(tries < 20 and 0.5 or 2)
+                if CFGSTATE ~= S then return end
+                if not S.finished then
+                    left = pass(cfg, done)
+                    if left == 0 then
+                        S.finished = true
+                        S.verifyUntil = tick() + 8
+                        print("[Config] every saved setting and keybind has been applied")
+                    elseif tries >= 300 then
+                        print("[Config] " .. left .. " saved setting(s) could not be applied (their widgets never appeared)")
+                        return
+                    end
+                elseif tick() < S.verifyUntil then
+                    local log = {}
+                    pass(cfg, {}, log)
+                    if #log > 0 then print("[Config] re-applied after load (the menu had reset them): " .. table.concat(log, ", ")) end
+                else
+                    return
+                end
+            end
+        end)
         return true
     end
 
