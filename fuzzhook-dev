@@ -41,11 +41,11 @@ end
 
 -- Counts errors caught while the script runs; the final "loaded" line needs this to be 0.
 local loadErrors = 0
--- PERFORMANCE PROFILER (Debug Options > "Performance Profiler" + "Performance Report (prints)").
+-- DEBUG MODE / PROFILER (Debug Options > "Debug Mode" + "Performance Report (prints)" + "Send Debug Report").
 -- Off by default. While off, guarded() costs one table lookup extra and nothing is recorded.
 -- While on, every named guarded() call / timed section adds its run time to FZPROF.s[name].
 -- (a global table on purpose: it needs no local-variable slot in the main chunk)
-FZPROF = { on = false, s = {}, t0 = tick(), errs = {}, seen = {}, done = false }
+FZPROF = { on = false, s = {}, t0 = tick(), born = tick(), errs = {}, seen = {}, done = false }
 FZPROF.add = function(name, dt)
     local s = FZPROF.s[name]
     if not s then
@@ -67,6 +67,8 @@ FZPROF.fail = function(where, err)
     if not P.seen[msg] and #P.errs < 5 then
         P.seen[msg] = true
         P.errs[#P.errs + 1] = msg
+        local he = P.hookError -- webhook 3 (only exists once the webhook block has loaded)
+        if he then he(where, tostring(err)) end
         if P.done then
             print("FuzzyHook has detected an Error, please restart the script or @ the creator. " .. msg)
         end
@@ -791,12 +793,14 @@ local IMPORTANT_TOGGLES = {
     { id = "opt_two",       label = "Report Alert", default = false, cb = printToggle("Report Alert") },
     { id = "opt_stafflist", label = "Staff Alert",  default = true,  cb = printToggle("Staff Alert") },
     { id = "opt_known",     label = "Known Staff Detector", default = true, cb = printToggle("Known Staff Detector") },
-    { id = "opt_info",      label = "Player Info",  default = true,  cb = printToggle("Player Info") },
-    { id = "opt_teams",     label = "View Player Teams", default = true, cb = printToggle("View Player Teams") },
-    { id = "opt_range",     label = "Enable Distance", default = false, cb = printToggle("Enable Distance") },
     { id = "opt_modtag",    label = "Moderator Tag", default = true, cb = printToggle("Moderator Tag") },
 }
 
+local PLAYER_TOGGLES = {
+    { id = "opt_info",      label = "Player Info",  default = true,  cb = printToggle("Player Info") },
+    { id = "opt_teams",     label = "View Player Teams", default = true, cb = printToggle("View Player Teams") },
+    { id = "opt_range",     label = "Enable Distance", default = false, cb = printToggle("Enable Distance") },
+}
 local SERVER_TOGGLES = {
     { id = "opt_four", label = "Server Loot Scanner", default = true, cb = printToggle("Server Loot Scanner") },
     { id = "opt_boss", label = "Boss Tracker",        default = true, cb = printToggle("Boss Tracker") },
@@ -892,7 +896,7 @@ end
 
 -- Title of the bottom-right section (built once, not per frame).
 -- If the menu font cannot draw the emoji and shows boxes / "?", swap them for "/!\" here.
-local DEBUG_TITLE = "\u{26A0}\u{FE0F} Debug Options \u{26A0}\u{FE0F}"
+local DEBUG_TITLE = "Developer Tools"
 
 -- Config buttons: the real functions are created at the end of the script (CONFIG SYSTEM block),
 -- these wrappers are built once so the menu callback allocates nothing.
@@ -909,6 +913,11 @@ Notification.hookTestBtn = function()
     local f = Notification.hookTest
     if f then f() end
 end
+-- "Send Debug Report" button (the real function is created in the DISCORD WEBHOOK block at the end)
+Notification.hookDebugBtn = function()
+    local f = Notification.hookDebug
+    if f then f() end
+end
 
 UI.AddTab("FuzzyHook - PRIVATE", function(tab)
     local profT0 = FZPROF.on and tick() -- menu callback timing (runs every frame)
@@ -917,6 +926,7 @@ UI.AddTab("FuzzyHook - PRIVATE", function(tab)
     important:Text(reportLabel)
     important:Button("Print Most Wanted", onMostWantedClick)
     addToggleSection(tab, "Server Toggles", "Left", SERVER_TOGGLES)
+    addToggleSection(tab, "Player Toggles", "Left", PLAYER_TOGGLES)
     -- Inventory Toggles
     addToggleSection(tab, "Inventory Toggles", "Left", INVENTORY_TOGGLES)
 
@@ -929,6 +939,9 @@ UI.AddTab("FuzzyHook - PRIVATE", function(tab)
     world:Toggle("opt_corpseesp", "Corpse ESP", false)
     Notification.kbCorpse = world:Keybind("opt_corpseesp_kb", 0, "toggle")
     world:SliderInt("corpseesp_range_m", "Corpse Range (meters)", 1, 350, 140)
+    world:Toggle("opt_corpseloot", "Corpse Loot Icons", false)
+    Notification.kbCorpseLoot = world:Keybind("opt_corpseloot_kb", 0, "toggle")
+    world:Tip("Shows icons under a corpse's label for the valuable items inside it (Server Loot list). Needs Corpse ESP on; icons come from the repo, so 'Disable Icon Loading' turns this off.")
 
     -- Settings: Performance Mode turns off the Hotbar fade and the notification slide
     local settings = tab:Section("Settings", "Left")
@@ -988,13 +1001,10 @@ UI.AddTab("FuzzyHook - PRIVATE", function(tab)
     iface:Combo("hotbar_target", "Hotbar Target", HOTBAR_MODES, 0)
     iface:Button("Reset UI Positions", onResetClick)
     iface:Button("Test Notification", onTestNotifyClick)
-    iface:Button("Test Webhook", Notification.hookTestBtn)
-    iface:Button("Hotbar Debug (prints)", onIconTestClick)
-    iface:Toggle("opt_prof", "Performance Profiler", false)
-    iface:Button("Performance Report (prints)", FZPROF.report)
-    iface:Button("Dropped Item Debug (prints)", Notification.dropDebug)
-    iface:Button("Staff Debug (prints)", Notification.staffDebug)
-    iface:Toggle("inv_showall", "Inv Aim: Show All (debug)", false)
+    iface:Toggle("opt_prof", "Debug Mode", false)
+    iface:Tip("Debug Mode times every loop of the script (small cost) so the report has timing data. Off by default.")
+    iface:Button("Send Debug Report", Notification.hookDebugBtn)
+    iface:Tip("One report with everything: performance (timings need Debug Mode on), hotbar, dropped items / corpses, errors, server. Pings the debug role. 30 s cooldown.")
     iface:Text("Drag a panel by its top bar")
     -- every widget above has been declared now: the config loader may apply saved values / keybinds
     Notification.uiBuilt = true
@@ -1054,39 +1064,6 @@ local function isStaffPlayer(plr)
     if type(tag) == "string" and string.lower(tag) == "early access" then return true end
     if colorIsStaff(col) then return true end
     return false
-end
-
--- "Staff Debug (prints)" button (Debug Options): shows what every player's tag attributes look like
-Notification.staffDebug = function()
-    local ok, err = pcall(function()
-        local rf = ReplicatedStorage:FindFirstChild("Players")
-        local list = Players:GetPlayers()
-        print("[Staff debug] players in game.Players: " .. #list .. " | ReplicatedStorage.Players found: " .. tostring(rf ~= nil))
-        for i = 1, #list do
-            local plr = list[i]
-            local name = plr.Name
-            local function dump(inst, where)
-                if not inst then return where .. ": (not found)" end
-                local tag = inst:GetAttribute("SpecialChatTag")
-                local col = inst:GetAttribute("SpecialChatTagColor")
-                local txt = where .. ": tag=" .. tostring(tag) .. " [" .. typeof(tag) .. "] colour=" .. tostring(col) .. " [" .. typeof(col) .. "]"
-                if col ~= nil then
-                    local okc, r, g, b = pcall(function() return col.R, col.G, col.B end)
-                    txt = txt .. (okc and (" R,G,B=" .. tostring(r) .. "," .. tostring(g) .. "," .. tostring(b)) or " (no R/G/B fields)")
-                end
-                return txt .. " -> staff=" .. tostring(isStaffPlayer(inst))
-            end
-            print("[Staff debug] " .. name .. " | " .. dump(plr, "game.Players") .. " | " .. dump(rf and rf:FindFirstChild(name), "ReplicatedStorage.Players"))
-            local okA, attrs = pcall(function() return plr:GetAttributes() end)
-            if okA and type(attrs) == "table" then
-                local keys = {}
-                for k in pairs(attrs) do keys[#keys + 1] = tostring(k) end
-                print("[Staff debug]   all attributes on game.Players." .. name .. ": " .. (#keys > 0 and table.concat(keys, ", ") or "(none)"))
-            end
-        end
-        print("[Staff debug] done")
-    end)
-    if not ok then print("[Staff debug] error: " .. tostring(err)) end
 end
 
 ----------------------------------------------------------------------
@@ -1651,8 +1628,7 @@ do
 
                 if not filteredKeychain then
                     local kids = c:GetChildren()
-                    -- state.all = debug toggle: show every item, listed or not
-                    local shown = force or state.all or isKeychain or isItemShown(name)
+                    local shown = force or isKeychain or isItemShown(name)
                     local childForce = force or isKeychain -- everything inside a keychain is shown
 
                     if shown then
@@ -1690,8 +1666,6 @@ do
             invHidden[t.cat] = h
             sig = sig .. (h and "1" or "0")
         end
-        local showAll = UI.GetValue("inv_showall") == true
-        sig = sig .. (showAll and "A" or "-")
 
         local now = tick()
         local c = by[name]
@@ -1707,7 +1681,7 @@ do
             if not inv then
                 out[1] = "No inventory found"
             else
-                local state = { count = 0, truncated = false, all = showAll }
+                local state = { count = 0, truncated = false }
                 collectInventory(inv:GetChildren(), 0, out, state)
                 if state.truncated then out[#out + 1] = "..." end
                 if #out == 0 then out[1] = "(nothing to show)" end
@@ -1897,6 +1871,9 @@ do
         imgState[item] = "loading"
         imgQueue[#imgQueue + 1] = item
     end
+
+    Notification.imgData, Notification.requestImg = imgData, requestImage -- used by the Corpse Loot Icons
+    Notification.imgState, Notification.imgInfo = imgState, imgInfo
 
     -- Tries every host in IMG_BASES for "<fileName>.png". Returns the data, or nil
     -- plus the reason the last host failed.
@@ -3582,6 +3559,8 @@ do
                         refreshLabel(name) -- [POSSIBLE MOD] label
                         if not K.set[name] then -- (a known staff member already got its own notification)
                             Notification.push("Staff Detector", name .. " has " .. STAFF_LABEL, STAFF_NOTIFY)
+                            local sh = Notification.staffHook
+                            if sh then sh(name, false) end
                         end
                     end
                 end
@@ -3622,6 +3601,8 @@ do
                         refreshLabel(name)
                         if not isMe then
                             Notification.push("Known Staff Detector", name .. " is KNOWN STAFF - DO NOT SHOOT!", STAFF_NOTIFY)
+                            local sh = Notification.staffHook
+                            if sh then sh(name, true) end
                         end
                     end
                 elseif not hit and K.set[name] then
@@ -4228,17 +4209,17 @@ end
 local function opacityStep()
     Notification.perf = UI.GetValue("opt_perf") == true
 
-    -- Performance Profiler switch: turning it on starts a fresh measurement
+    -- Debug Mode switch: turning it on starts a fresh measurement
     local P = FZPROF
     local want = UI.GetValue("opt_prof") == true
     if want and not P.on then
         P.s = {}
         P.t0 = tick()
         P.kb0, P.kbMin, P.kbMax = nil, nil, nil
-        print("[Perf] profiler ON - let it run 15-30 seconds, then press 'Performance Report (prints)'")
+        print("[Debug] Debug Mode ON - let it run 15-30 seconds, then press 'Performance Report (prints)' or 'Send Debug Report'")
     elseif P.on and not want then
         P.tEnd = tick()
-        print("[Perf] profiler OFF (the report still works until you turn it on again)")
+        print("[Debug] Debug Mode OFF (the report still works until you turn it on again)")
     end
     P.on = want
     if want and type(collectgarbage) == "function" then
@@ -4371,7 +4352,17 @@ do
         return d
     end
 
+    freeDraw.img = {}                   -- spare Image drawings (Corpse Loot Icons)
     local function releaseEntry(e)
+        local ic = e.ic
+        if ic then
+            for k = 1, #ic do
+                ic[k].d.Visible = false
+                ic[k].name, ic[k].vis = nil, false
+                freeDraw.img[#freeDraw.img + 1] = ic[k].d
+            end
+            e.ic, e.icShown = nil, false
+        end
         if e.vis then e.d.Visible = false end
         e.vis = false
         freeDraw[#freeDraw + 1] = e.d
@@ -4649,7 +4640,7 @@ do
                             local dist = (pp - origin).Magnitude
                             if dist <= state.crange then
                                 state.corpses[#state.corpses + 1] = { part = part, wpos = pp, name = "[Corpse] " .. nm,
-                                    dist = dist, col = wtcColor["Corpse"], addr = addr, corpse = true }
+                                    dist = dist, col = wtcColor["Corpse"], addr = addr, corpse = true, obj = obj }
                             end
                         end
                     else
@@ -4669,11 +4660,35 @@ do
     -- The ESP is active while its toggle is ON and its keybind is active. A keybind has its own state
     -- (UI.GetValue does not return it), read from the widget: with no key assigned (0) the toggle alone
     -- decides; with a key assigned, the key's mode (toggle / hold / always / click) decides.
-    local function kbCheck() -- (a named function: pcall(kbCheck) allocates nothing, this runs every frame)
-        local kb = Notification.kbDrop
+    -- Keybind state the script owns. In "toggle" mode the widget's own on/off state can start out opposite to
+    -- the menu toggle after a launch / config load (the ESP then looked inverted until the toggle was
+    -- switched off and on). So the ESP starts ON and every change of the widget's state (= one key press)
+    -- flips it; hold / always / click modes still follow the widget directly.
+    CP.kbs = {}
+    CP.kbOn = function(kb, id)
         local key = kb:GetKey()
-        if key ~= nil and key ~= 0 then return kb:IsEnabled() == true end
-        return true
+        if key == nil or key == 0 then
+            CP.kbs[id] = nil -- unbound: forget, the next bind starts fresh
+            return true
+        end
+        local cur = kb:IsEnabled() == true
+        local st = CP.kbs[id]
+        if not st then
+            CP.kbs[id] = { last = cur, on = true }
+            return true
+        end
+        local okm, mode = pcall(function() return kb:GetType() end)
+        if okm and string.lower(tostring(mode)) == "toggle" then
+            if cur ~= st.last then st.on = not st.on end
+            st.last = cur
+            return st.on
+        end
+        st.last = cur
+        return cur
+    end
+
+    local function kbCheck() -- (a named function: pcall(kbCheck) allocates nothing, this runs every frame)
+        return CP.kbOn(Notification.kbDrop, "drop")
     end
 
     local function espActive()
@@ -4686,10 +4701,7 @@ do
 
     -- Corpse ESP: toggle "opt_corpseesp" + its own keybind (Notification.kbCorpse), same rules as above
     local function corpseKb()
-        local kb = Notification.kbCorpse
-        local key = kb:GetKey()
-        if key ~= nil and key ~= 0 then return kb:IsEnabled() == true end
-        return true
+        return CP.kbOn(Notification.kbCorpse, "corpse")
     end
 
     local function corpseActive()
@@ -4698,6 +4710,122 @@ do
         local ok, on = pcall(corpseKb)
         if not ok then return true end
         return on
+    end
+
+    -- ---- Corpse Loot Icons ----
+    -- Items looked for inside a corpse: the Server Loot list (LOOT_ITEMS) plus AI2 (temporary, for testing).
+    -- Searched: <corpse>.Inventory and, when there is one, <corpse>.Character (children, 4 levels deep, max 150 objects).
+    -- Results are cached per corpse (re-read every 6 scans), at most 3 corpses are read per scan, the walk
+    -- is time-sliced like the main scan, and icons are drawn by the render hook like the text labels.
+    CP.lset, CP.loot, CP.isz = {}, {}, 26
+    for i = 1, #LOOT_ITEMS do CP.lset[LOOT_ITEMS[i]] = true end
+
+    CP.lootActive = function()
+        if UI.GetValue("opt_corpseloot") ~= true then return false end
+        if UI.GetValue("opt_icons_off") == true then return false end
+        local kb = Notification.kbCorpseLoot
+        if kb then
+            local ok, on = pcall(CP.kbOn, kb, "loot")
+            if ok then return on end
+        end
+        return true
+    end
+
+    CP.readLoot = function(f, state)
+        local addr = f.addr
+        local c = addr and CP.loot[addr]
+        if c and CP.scan - c.scan < 6 then f.items = c.names return end
+        if (state.reads or 0) >= 3 then
+            if c then f.items = c.names end
+            return
+        end
+        state.reads = (state.reads or 0) + 1
+        local names, seen, cnt = {}, {}, 0
+        local lset = CP.lset
+        local function walk(parent, depth)
+            local kids = parent:GetChildren()
+            for i = 1, #kids do
+                if cnt >= 150 then return end
+                cnt = cnt + 1
+                local tn = tick()
+                if tn - state.t >= ESP_SLICE then
+                    state.cpu = state.cpu + (tn - state.t)
+                    task.wait()
+                    state.t = tick()
+                end
+                local k = kids[i]
+                local nm = k.Name
+                if lset[nm] then
+                    if not seen[nm] and #names < 4 then
+                        seen[nm] = true
+                        names[#names + 1] = nm
+                    end
+                elseif depth < 4 then
+                    walk(k, depth + 1)
+                end
+            end
+        end
+        local obj = f.obj
+        local inv = obj:FindFirstChild("Inventory")
+        if inv then walk(inv, 1) end
+        local ch = obj:FindFirstChild("Character")
+        if ch then walk(ch, 1) end
+        local rq = Notification.requestImg
+        if rq then for i = 1, #names do rq(names[i]) end end -- starts the (cached) icon download
+        if addr then CP.loot[addr] = { names = names, scan = CP.scan } end
+        f.items = names
+    end
+
+    -- Draws / moves the icon row of one corpse label (called per frame; only writes what changed)
+    CP.icons = function(e, x, y)
+        local items = e.items
+        local data = Notification.imgData
+        if not data then return end
+        local ic = e.ic
+        if not ic then ic = {}; e.ic = ic end
+        local n, isz = 0, CP.isz
+        for k = 1, #items do
+            local nm = items[k]
+            local dat = data[nm]
+            if dat then
+                n = n + 1
+                local sl = ic[n]
+                if not sl then
+                    local d = table.remove(freeDraw.img) or Drawing.new("Image")
+                    d.Size = Vector2.new(isz, isz)
+                    sl = { d = d }
+                    ic[n] = sl
+                    e.icX = nil
+                end
+                if sl.name ~= nm then sl.name = nm; sl.d.Data = dat; e.icX = nil end
+            end
+        end
+        for k = #ic, n + 1, -1 do
+            local sl = ic[k]
+            sl.d.Visible = false
+            sl.name, sl.vis = nil, false
+            freeDraw.img[#freeDraw.img + 1] = sl.d
+            ic[k] = nil
+        end
+        if n == 0 then return end
+        if e.icX == nil or math.abs(e.icX - x) >= 0.05 or math.abs(e.icY - y) >= 0.05 then
+            e.icX, e.icY = x, y
+            local x0 = x - (n * (isz + 2) - 2) / 2
+            for k = 1, n do ic[k].d.Position = Vector2.new(x0 + (k - 1) * (isz + 2), y) end
+        end
+        for k = 1, n do
+            local sl = ic[k]
+            if not sl.vis then sl.vis = true; sl.d.Visible = true end
+        end
+        e.icShown = true
+    end
+
+    CP.iconsHide = function(e)
+        local ic = e.ic
+        if ic then
+            for k = 1, #ic do ic[k].d.Visible = false; ic[k].vis = false end
+        end
+        e.icShown = false
     end
 
     -- Cached on/off state of both ESPs (toggle + keybind reads are several calls each and used to run
@@ -4709,6 +4837,7 @@ do
         A.at = now
         A.item = espActive()
         A.corpse = corpseActive()
+        A.loot = A.corpse and CP.lootActive()
         A.size = UI.GetValue("dropesp_textsize")
         A.fps = UI.GetValue("dropesp_fps")
         return A
@@ -4741,7 +4870,7 @@ do
         local A = refreshActive(true)
         local itemOn, corpseOn = A.item, A.corpse
         CP.scan = CP.scan + 1
-        if CP.scan % 600 == 0 then CP.no, CP.junk, CP.low, CP.pos, CP.nh = {}, {}, {}, {}, {} end -- rare: a reset costs one slow scan -- forget old notes now and then
+        if CP.scan % 600 == 0 then CP.no, CP.junk, CP.low, CP.pos, CP.nh, CP.loot = {}, {}, {}, {}, {}, {} end -- rare: a reset costs one slow scan -- forget old notes now and then
         local found = {}
         local t0 = tick()
         local state = { n = 0, items = itemOn, scan = CP.scan, cpu = 0, t = t0 }
@@ -4769,6 +4898,15 @@ do
             end
             n = #found
         end
+        if A.loot and state.corpses then
+            state.t = tick()
+            for i = 1, #found do
+                local f = found[i]
+                if f.corpse then CP.readLoot(f, state) end
+            end
+            state.cpu = state.cpu + (tick() - state.t)
+            if FZPROF.on then FZPROF.add("corpse loot read (cpu, part of the scan)", tick() - state.t) end
+        end
 
         -- the scan interval grows with the scan cost (never above ~5% of the time, 8 s at most); a very
         -- expensive scan (300 ms or more of real work) also halves the label caps until it gets cheap again
@@ -4789,6 +4927,7 @@ do
             local e = addr and byAddr[addr]
             if e then
                 e.part, e.wpos, e.dist, e.name, e.col = f.part, f.wpos, f.dist, f.name, f.col
+                e.items, e.obj = f.items, f.obj
                 e.colSet = false -- colour settings may have changed: write it again once
                 e.gone = 0
             else
@@ -4826,7 +4965,7 @@ do
     local function espRender()
         -- toggle / keybind / size are read from a cache refreshed 5 times a second
         local A = refreshActive()
-        local itemOn, corpseOn = A.item, A.corpse
+        local itemOn, corpseOn, lootOn = A.item, A.corpse, A.loot
         if entryCount > 0 and not itemOn and not corpseOn then
             clearEntries() -- turned off (toggle or keybind): hide every label immediately
             return
@@ -4904,6 +5043,11 @@ do
                         e.px, e.py = px, py
                         d.Position = Vector2.new(px, py)
                     end
+                    if lootOn and e.items and #e.items > 0 then
+                        CP.icons(e, px, py + espSize + 3)
+                    elseif e.icShown then
+                        CP.iconsHide(e)
+                    end
                 end
             end
 
@@ -4913,6 +5057,7 @@ do
                 if off <= 2 and e.vis then show = true end -- short grace period: keep the last position
             end
 
+            if not show and e.icShown then CP.iconsHide(e) end
             if show then used = used + 1 end
             if e.vis ~= show then
                 e.vis = show
@@ -5048,6 +5193,34 @@ do
                     for _ in pairs(CP.pos) do c = c + 1 end
                     return a .. " skipped names, " .. b .. " not-corpse objects, " .. c .. " positions"
                 end)())
+            do -- Corpse Loot Icons
+                local A = refreshActive(true)
+                print("[Drop debug] loot icons: toggle=" .. tostring(UI.GetValue("opt_corpseloot")) .. " active=" .. tostring(A.loot)
+                    .. " icons_off=" .. tostring(UI.GetValue("opt_icons_off")) .. " | requestImg=" .. tostring(Notification.requestImg ~= nil))
+                local shown = 0
+                for i = 1, #entries do
+                    local e = entries[i]
+                    if e.corpse and shown < 4 then
+                        shown = shown + 1
+                        local items = e.items
+                        local st = {}
+                        if items then
+                            for k = 1, #items do
+                                local nm = items[k]
+                                st[#st + 1] = nm .. "=" .. tostring(Notification.imgState and Notification.imgState[nm])
+                                    .. (Notification.imgData and Notification.imgData[nm] and "(data)" or "(no data)")
+                                    .. ((Notification.imgState and Notification.imgState[nm] == "fail") and (" why: " .. tostring(Notification.imgInfo[nm])) or "")
+                            end
+                        end
+                        local obj = e.obj
+                        local inv = obj and obj.Parent and obj:FindFirstChild("Inventory")
+                        local ch = obj and obj.Parent and obj:FindFirstChild("Character")
+                        print("[Drop debug] corpse " .. e.name .. " dist=" .. math.floor(e.dist * M_PER_STUD) .. "m | Inventory="
+                            .. (inv and (#inv:GetChildren() .. " children") or "none") .. " | Character=" .. (ch and "yes" or "no")
+                            .. " | items found: " .. (items and (#items == 0 and "none" or table.concat(st, ", ")) or "not read yet"))
+                    end
+                end
+            end
             print("[Drop debug] ESP state: scanned entries = " .. entryCount .. ", drawn on screen = " .. shownCount)
             if entryCount > 0 then
                 local e = entries[1]
@@ -5122,7 +5295,7 @@ FZPROF.report = function()
     local P = FZPROF
     local ok, err = pcall(function()
         if not P.t0 then
-            print("[Perf] no data yet: turn on 'Performance Profiler' in Debug Options, wait 15-30 seconds, then press this button")
+            print("[Perf] no data yet: turn on 'Debug Mode' in Debug Options, wait 15-30 seconds, then press this button")
             return
         end
         local elapsed = (P.on and tick() or P.tEnd or tick()) - P.t0
@@ -5132,7 +5305,7 @@ FZPROF.report = function()
         for name, st in pairs(P.s) do rows[#rows + 1] = { name = name, st = st } end
         table.sort(rows, function(a, b) return a.st.sum > b.st.sum end)
 
-        print(string.format("[Perf] ===== report: measured for %.1f s (profiler %s) =====", elapsed, P.on and "ON" or "OFF"))
+        print(string.format("[Perf] ===== report: measured for %.1f s (Debug Mode %s) =====", elapsed, P.on and "ON" or "OFF"))
         local total = 0
         for i = 1, #rows do
             local r, st = rows[i], rows[i].st
@@ -5181,14 +5354,14 @@ do local okCfg, errCfg = pcall(function()
 
     -- ids of every saved bool / number widget (built once from the same lists the menu uses)
     local IDS = {}
-    for _, list in ipairs({ IMPORTANT_TOGGLES, SERVER_TOGGLES, INVENTORY_TOGGLES }) do
+    for _, list in ipairs({ IMPORTANT_TOGGLES, PLAYER_TOGGLES, SERVER_TOGGLES, INVENTORY_TOGGLES }) do
         for i = 1, #list do IDS[#IDS + 1] = list[i].id end
     end
     for i = 1, #CATEGORY_TOGGLES do
         IDS[#IDS + 1] = CATEGORY_TOGGLES[i].id
         IDS[#IDS + 1] = CATEGORY_TOGGLES[i].espId
     end
-    for id in string.gmatch([[opt_dropesp dropesp_range_m opt_corpseesp corpseesp_range_m ui_opacity dropesp_textsize dropesp_fps
+    for id in string.gmatch([[opt_dropesp dropesp_range_m opt_corpseesp opt_corpseloot corpseesp_range_m ui_opacity dropesp_textsize dropesp_fps
         opt_perf opt_icons_off hotbar_target wtc_armor wtc_weapons wtc_super wtc_valuable wtc_meds wtc_stims
         wtc_corpse]], "%S+") do
         IDS[#IDS + 1] = id
@@ -5197,7 +5370,7 @@ do local okCfg, errCfg = pcall(function()
     for id in string.gmatch("wtc_armor_col wtc_weapons_col wtc_super_col wtc_valuable_col wtc_meds_col wtc_stims_col wtc_corpse_col", "%S+") do
         COLORS[#COLORS + 1] = id
     end
-    local KEYS = { opt_dropesp_kb = "kbDrop", opt_corpseesp_kb = "kbCorpse" } -- keybind id -> field on Notification
+    local KEYS = { opt_dropesp_kb = "kbDrop", opt_corpseesp_kb = "kbCorpse", opt_corpseloot_kb = "kbCorpseLoot" } -- keybind id -> field on Notification
 
     -- Allowed range of the sliders. A value outside it (like the 0 that ended up in the saved file when a
     -- slider had not been created yet) is neither saved nor applied: the slider keeps its default.
@@ -5489,22 +5662,47 @@ if not okCfg then FZPROF.fail("config", errCfg) end
 end
 
 ----------------------------------------------------------------------
--- DISCORD WEBHOOK
+-- DISCORD WEBHOOKS
+-- Three webhooks, none of them stored in this file. They are read ONCE (on the first message sent) from the
+-- repo file below, one "<id> <token>" pair per line, and rebuilt as https://discord.com/api/webhooks/<id>/<token>:
+--   1 = staff alerts   (Notification.hookStaff, "Test Webhook")
+--   2 = debug reports  ("Send Debug Report": needs Debug Mode on, pings the debug role)
+--   3 = error log      (Notification.hookError: every new caught error + the line that broke)
 -- Notification.hookStaff(name, userId) sends the staff alert embed ("Unlisted Possible Staff Detected",
 -- Roblox headshot + profile link, server info read from game.ReplicatedStorage.ServerStatus: ServerId,
 -- ServerLocation, Premium, Veteran). "Test Webhook" (Debug Options) sends a plain test message with no account info.
--- The staff detectors are NOT wired to it yet; when they are, they just call Notification.hookStaff(...).
+-- The staff detectors call Notification.staffHook(name, known): red embed = unlisted, orange = on the repo list.
 -- Messages go out from ONE background thread, at most one every 2 seconds (Discord rate limits), so a
--- send never stalls a frame. The webhook URL is in this file: anyone who has the file can post to it.
+-- send never stalls a frame. A failed list download is retried at most every 30 seconds.
 -- (wrapped in a function so its locals do not count against the main chunk's 200-local limit)
 ----------------------------------------------------------------------
 do
 local okHook, errHook = pcall(function()
-    local URL = "https://discord.com/api/webhooks/1570209919301451878/j-VHJnCli4Y1fCRajjEwx_RahZtG8Oz85RETFBagMLUNW_LaQsE5b15rysujXRqS5EyL"
+    local LIST_URL = "https://raw.githubusercontent.com/123123123332221111/-x-Lp-6L-0-S-x-m-Z-2ZCi-Z/refs/heads/main/%2B"
+    local BASE = "https://discord.com/api/webhooks/"
+    local DEBUG_ROLE = "1570219756269605067" -- role pinged by "Send Debug Report"
     local RED = 14221316 -- Color3 (217, 0, 4) as a Discord embed colour
     local Http = game:GetService("HttpService")
     local NOTE = { seconds = 5, color = Color3.fromRGB(88, 101, 242) }
     local queue, running = {}, false
+
+    -- hooks[1..3] = full webhook URLs, filled once from LIST_URL (runs inside the sender thread, never on a frame)
+    local hooks, hooksTried = nil, -1000
+    local function loadHooks()
+        if hooks then return true end
+        if not httpget then return false, "httpget is not available" end
+        if tick() - hooksTried < 30 then return false, "webhook list could not be loaded (retrying)" end
+        hooksTried = tick()
+        local ok, res = pcall(httpget, LIST_URL)
+        if not ok or type(res) ~= "string" then return false, "webhook list could not be loaded" end
+        local list = {}
+        for id, token in string.gmatch(res, "(%d+)%s+([%w_%-]+)") do
+            list[#list + 1] = BASE .. id .. "/" .. token
+        end
+        if #list == 0 then return false, "webhook list is empty" end
+        hooks = list
+        return true
+    end
 
     -- Roblox headshot image URL for a user id. Discord did not show the thumbnail when given Roblox's
     -- redirect URL, so the real image URL is looked up through Roblox's thumbnails API (one request per
@@ -5534,25 +5732,35 @@ local okHook, errHook = pcall(function()
         wait(0.05) -- yields first, so a button click returns immediately
         while #queue > 0 do
             local item = table.remove(queue, 1)
-            if item.uid then item.embed.thumbnail = { url = thumbUrl(item.uid) } end -- headshot, top right
-            local okB, body = pcall(function()
-                return Http:JSONEncode({ username = "FuzzyHook", embeds = { item.embed } })
-            end)
-            local ok, res = false, "could not build the message"
-            if okB then ok, res = pcall(httppost, URL, body, "application/json") end
             local err
-            if not ok then
-                err = tostring(res)
-            elseif type(res) == "string" and string.find(res, '"message"', 1, true) then
-                err = res -- Discord answers errors (bad URL, rate limit...) with {"message": ...}
-            end
-            if item.test then
-                if err then
-                    print("[Webhook] failed: " .. err)
-                    Notification.push("Webhook", "Failed: " .. string.sub(err, 1, 30), NOTE)
-                else
-                    Notification.push("Webhook", "Test sent - check Discord", NOTE)
+            local okL, why = loadHooks() -- first message only: one small request, then cached
+            local url = okL and hooks[item.hook]
+            if not url then
+                err = okL and ("webhook #" .. item.hook .. " is not in the list") or why
+            else
+                if item.uid then item.embed.thumbnail = { url = thumbUrl(item.uid) } end -- headshot, top right
+                local okB, body = pcall(function()
+                    local payload = { username = "FuzzyHook", embeds = { item.embed } }
+                    if item.content then
+                        payload.content = item.content
+                        payload.allowed_mentions = { roles = item.roles } -- lets the role mention really ping
+                    end
+                    return Http:JSONEncode(payload)
+                end)
+                local ok, res = false, "could not build the message"
+                if okB then ok, res = pcall(httppost, url, body, "application/json") end
+                if not ok then
+                    err = tostring(res)
+                elseif type(res) == "string" and string.find(res, '"message"', 1, true) then
+                    err = res -- Discord answers errors (bad URL, rate limit...) with {"message": ...}
                 end
+            end
+            if err then
+                err = string.gsub(err, "discord%.com/api/webhooks/[%w_%-/]+", "<webhook>") -- never print the URL
+                print("[Webhook] failed: " .. err)
+                if item.ok then Notification.push("Webhook", "Failed: " .. string.sub(err, 1, 30), NOTE) end
+            elseif item.ok then
+                Notification.push("Webhook", item.ok, NOTE)
             end
             wait(2)
         end
@@ -5561,14 +5769,19 @@ local okHook, errHook = pcall(function()
 
     -- embed = a Discord embed table (title, url, description, color, thumbnail, fields, footer ...);
     -- uid (optional) = Roblox user id whose headshot becomes the thumbnail (looked up when it is sent);
+    -- extra (optional) = { hook = 1|2|3 (which repo webhook, default 1), content = "text above the embed",
+    --   roles = { "role id" } (roles the content may ping), ok = "notification shown once it was sent" };
     -- returns false if it could not be queued
-    function Notification.webhook(embed, isTest, uid)
+    function Notification.webhook(embed, isTest, uid, extra)
+        extra = extra or {}
+        local okText = extra.ok or (isTest == true and "Test sent - check Discord" or nil)
         if not httppost then
-            if isTest then Notification.push("Webhook", "httppost is not available", NOTE) end
+            if okText then Notification.push("Webhook", "httppost is not available", NOTE) end
             return false
         end
         embed.color = embed.color or RED
-        queue[#queue + 1] = { embed = embed, uid = uid, test = isTest == true }
+        queue[#queue + 1] = { embed = embed, uid = uid, hook = extra.hook or 1, content = extra.content,
+            roles = extra.roles, ok = okText }
         if not running then
             running = true
             task.spawn(worker)
@@ -5608,6 +5821,9 @@ local okHook, errHook = pcall(function()
             prem, vet = srv("Premium"), srv("Veteran")
         end
         local premText, vetText = flag(prem), flag(vet)
+        local unknownBoth = premText == FLAG_UNKNOWN and vetText == FLAG_UNKNOWN -- decides the "Main Menu" row below
+        if premText == FLAG_UNKNOWN then premText = "\u{274C}" end -- unreadable shows as the red cross
+        if vetText == FLAG_UNKNOWN then vetText = "\u{274C}" end
         local fields = {
             { name = "\u{1F5A5}\u{FE0F} Server ID", value = (type(id) == "string" and id ~= "") and id or "Unknown", inline = true },
             { name = "\u{1F30D} Server Location", value = (type(loc) == "string" and loc ~= "") and loc or "Unknown", inline = true },
@@ -5618,30 +5834,90 @@ local okHook, errHook = pcall(function()
         }
         -- "Main Menu": only added when BOTH Premium and Veteran could not be read (Unknown). Own row,
         -- same two-column look as the rows above.
-        if premText == FLAG_UNKNOWN and vetText == FLAG_UNKNOWN then
+        if unknownBoth then
             fields[#fields + 1] = { name = "\u{1F3E0} Main Menu", value = "\u{2705}", inline = true }
             fields[#fields + 1] = { name = "\u{200B}", value = "\u{200B}", inline = true }
             fields[#fields + 1] = { name = "\u{200B}", value = "\u{200B}", inline = true }
         end
+        -- City13: game.ReplicatedFirst.ServerInfo has the attribute MapId = "City13" on that server
+        local isCity = false
+        pcall(function()
+            local si = game.ReplicatedFirst:FindFirstChild("ServerInfo")
+            local m = si and si:GetAttribute("MapId")
+            isCity = type(m) == "string" and string.lower(m) == "city13"
+        end)
+        fields[#fields + 1] = { name = "\u{1F3D9}\u{FE0F} City13 Server", value = isCity and "\u{2705}" or "\u{274C}", inline = true }
+        fields[#fields + 1] = { name = "\u{200B}", value = "\u{200B}", inline = true }
+        fields[#fields + 1] = { name = "\u{200B}", value = "\u{200B}", inline = true }
         return fields
     end
 
     -- Staff alert embed: title links to the staff member's Roblox profile, their headshot is the thumbnail
     -- (top right), the description has "name (ID)" as a direct profile link, then the server info.
     -- note = optional italic line above the link. No image at the bottom.
-    function Notification.hookStaff(name, userId, note, isTest)
+    function Notification.hookStaff(name, userId, note, isTest, known)
         local profile = "https://www.roblox.com/users/" .. userId .. "/profile"
         local safe = (string.gsub(name, "[_*~`|]", "\\%0")) -- keep usernames from turning into markdown
         local desc = "\u{1F464} [" .. safe .. "](" .. profile .. ")  \u{2022}  ID: `" .. userId .. "`"
         if note then desc = note .. "\n" .. desc end
         return Notification.webhook({
-            title = "Unlisted Possible Staff Detected",
+            title = known and "Known Staff Detected" or "Unlisted Possible Staff Detected",
             url = profile,
             description = desc,
-            color = RED,
+            color = known and 16753940 or RED, -- orange = on the repo list, red = not on it
             fields = serverFields(),
             footer = { text = "FuzzyHook" },
         }, isTest, userId) -- userId: the sender thread adds the headshot thumbnail
+    end
+
+    -- Called by the staff detectors: one embed per player per kind (known = orange, unlisted = red) per session.
+    local hookSent = {}
+    Notification.staffHook = function(name, known)
+        local key = name .. (known and "|k" or "|u")
+        if hookSent[key] then return end
+        hookSent[key] = true
+        pcall(function()
+            local plr = Players:FindFirstChild(name)
+            local uid = plr and plr.UserId
+            if uid and uid > 0 then Notification.hookStaff(name, uid, nil, false, known) end
+        end)
+    end
+
+    -- Error log -> webhook 3. Called for every new caught error (FZPROF.fail) with the Lua error text, which
+    -- contains the line that broke ("Matcha:1234: attempt to ..."). No account details. At most 8 per session,
+    -- each different message only once; errors from before this block existed are sent when it finishes loading.
+    local errSent, errCount = {}, 0
+    Notification.hookError = function(where, err)
+        local key = where .. err
+        if errSent[key] or errCount >= 8 then return end
+        errSent[key] = true
+        errCount = errCount + 1
+        pcall(function()
+            local txt = string.gsub(err, "```", string.rep("'", 3))
+            if #txt > 900 then txt = string.sub(txt, 1, 900) .. "..." end
+            local fields = {
+                { name = "\u{1F4CD} Where", value = string.sub(where, 1, 100), inline = true },
+                { name = "\u{23F1}\u{FE0F} Script running", value = (function()
+                    local t = math.floor(tick() - (FZPROF.born or tick()))
+                    return string.format("%02d:%02d", math.floor(t / 60), t % 60)
+                end)(), inline = true },
+            }
+            local embed = {
+                title = "Script Error",
+                description = "```\n" .. txt .. "\n```",
+                color = RED,
+                fields = fields,
+                footer = { text = "FuzzyHook" },
+            }
+            local okT, ts = pcall(os.date, "!%Y-%m-%dT%H:%M:%SZ")
+            if okT and type(ts) == "string" then embed.timestamp = ts end
+            Notification.webhook(embed, false, nil, { hook = 3 })
+        end)
+    end
+    FZPROF.hookError = Notification.hookError
+    for i = 1, #FZPROF.errs do -- errors caught before this block loaded
+        local m = FZPROF.errs[i]
+        Notification.hookError("earlier", m)
     end
 
     -- "Test Webhook" button: sends a plain test message with NO account details
@@ -5657,6 +5933,125 @@ local okHook, errHook = pcall(function()
             }, true) -- true = test; no user id is passed, so no headshot is attached
         end)
         if not ok then Notification.push("Webhook", "Test failed to build", NOTE) end
+    end
+
+    -- "Send Debug Report" button: needs Debug Mode on. Sends what "Performance Report (prints)" shows (heaviest
+    -- loops, memory, drawing count, caught errors, server info) to webhook 2 and pings DEBUG_ROLE. Contains NO
+    -- account details. The embed is built here on the click, the send happens in the sender thread.
+    -- Runs one of the old "(prints)" debug functions with print() redirected into a buffer, so the same output
+    -- goes into a Discord field instead of the console. print is always restored; output is cut to fit a field.
+    local function captureDebug(fn, limit, prio)
+        limit = limit or 930
+        if type(fn) ~= "function" then return "not available" end
+        local buf, old = {}, print
+        print = function(...)
+            local t = {}
+            for i = 1, select("#", ...) do t[i] = tostring((select(i, ...))) end
+            buf[#buf + 1] = table.concat(t, " ")
+        end
+        pcall(fn)
+        print = old
+        if #buf == 0 then return "no output" end
+        if prio then -- lines containing one of the prio words go first (so a cut-off never hides them)
+            local a, b = {}, {}
+            for i = 1, #buf do
+                local hit = false
+                for j = 1, #prio do if string.find(buf[i], prio[j], 1, true) then hit = true break end end
+                if hit then a[#a + 1] = buf[i] else b[#b + 1] = buf[i] end
+            end
+            for i = 1, #b do a[#a + 1] = b[i] end
+            buf = a
+        end
+        local txt = string.gsub(table.concat(buf, "\n"), "```", string.rep("'", 3))
+        if #txt > limit then txt = string.sub(txt, 1, limit) .. "\n..." end
+        return "```\n" .. txt .. "\n```"
+    end
+
+    local lastDebug = -1000
+    Notification.hookDebug = function()
+        local P = FZPROF
+        local now = tick()
+        if now - lastDebug < 30 then
+            Notification.push("Debug", "Wait " .. math.ceil(30 - (now - lastDebug)) .. "s before sending again", NOTE)
+            return
+        end
+
+        local okB, errB = pcall(function()
+            local elapsed = now - (P.t0 or now)
+            if elapsed < 0.001 then elapsed = 0.001 end
+
+            local rows, total = {}, 0
+            for name, st in pairs(P.s) do
+                rows[#rows + 1] = { name = name, st = st }
+                total = total + st.sum
+            end
+            table.sort(rows, function(a, b) return a.st.sum > b.st.sum end)
+
+            local lines = {}
+            for i = 1, math.min(8, #rows) do
+                local r = rows[i]
+                lines[#lines + 1] = string.format("%5.2f%%  max %6.1fms  %s", r.st.sum / elapsed * 100, r.st.max * 1000,
+                    string.sub(r.name, 1, 38))
+            end
+            local heavy = (#lines > 0) and ("```\n" .. table.concat(lines, "\n") .. "\n```") or "no timing data (turn on Debug Mode, wait 15-30 s, send again)"
+
+            local mem = "n/a"
+            if P.kbNow and P.kb0 then
+                mem = string.format("now %.0f KB\nlow %.0f / high %.0f KB", P.kbNow, P.kbMin or P.kbNow, P.kbMax or P.kbNow)
+            end
+
+            local drawings = 0
+            for i = 1, #panels do drawings = drawings + #panels[i].items end
+
+            local errText = "None"
+            if #P.errs > 0 then
+                errText = "```\n" .. string.sub(table.concat(P.errs, "\n"), 1, 900) .. "\n```"
+            end
+
+            local fields = {
+                { name = "\u{23F1}\u{FE0F} Measured", value = string.format("%.0f s, %d tracked sections", elapsed, #rows), inline = true },
+                { name = "\u{2699}\u{FE0F} Total load", value = string.format("%.1f%% of real time", total / elapsed * 100), inline = true },
+                { name = "\u{1F9E0} Lua memory", value = mem, inline = true },
+                { name = "\u{1F4CA} Heaviest (load, worst run)", value = heavy, inline = false },
+                { name = "\u{1F5BC}\u{FE0F} Panel drawings", value = tostring(drawings) .. " in " .. #panels .. " panels", inline = true },
+                { name = "\u{26A0}\u{FE0F} Errors caught", value = errText, inline = false },
+                { name = "\u{1F3AF} Hotbar Debug", value = captureDebug(iconTest), inline = false },
+            }
+            local sf = serverFields()
+            for i = 1, #sf do fields[#fields + 1] = sf[i] end
+
+            local embed = {
+                title = "Debug Report",
+                description = "Debug report sent from the menu.",
+                color = 15105570, -- orange
+                fields = fields,
+                footer = { text = "FuzzyHook" },
+            }
+            local okT, ts = pcall(os.date, "!%Y-%m-%dT%H:%M:%SZ")
+            if okT and type(ts) == "string" then embed.timestamp = ts end
+
+            -- second message: Dropped Item / Corpse debug, as the embed description (4000 characters instead of a 1000-character field)
+            local dropTxt = captureDebug(Notification.dropDebug, 3800, { "loot icons", "corpse", "ESP state", "last scan" })
+            Notification.webhook({
+                title = "\u{1F4E6} Dropped Item / Corpse Debug",
+                description = dropTxt,
+                color = 15105570,
+                footer = { text = "FuzzyHook" },
+            }, false, nil, { hook = 2 })
+
+            if Notification.webhook(embed, false, nil, {
+                hook = 2,
+                content = "<@&" .. DEBUG_ROLE .. "> Debug report",
+                roles = { DEBUG_ROLE },
+                ok = "Debug report sent",
+            }) then
+                lastDebug = now
+            end
+        end)
+        if not okB then
+            Notification.push("Debug", "Report failed to build", NOTE)
+            FZPROF.fail("debug report", errB)
+        end
     end
 end)
 if not okHook then FZPROF.fail("webhook", errHook) end
